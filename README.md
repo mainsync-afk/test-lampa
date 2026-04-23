@@ -1,1 +1,2 @@
-https://mainsync-afk.github.io/test-lampa/trakt_folder_sync(22).js - с нуля
+https://mainsync-afk.github.io/test-lampa/trakt_folder_sync(22).js - с нуля <br>
+https://mainsync-afk.github.io/test-lampa/trakt_folder_sync(42).js - убирает шоу из continue watching в trakt
