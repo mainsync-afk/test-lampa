@@ -8,9 +8,10 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.3.0';
+    var VERSION         = '0.4.0';
 
     var SYNC_TAG        = 'TraktFolderSync';
+    var COMPONENT       = 'trakt_folder_sync';
     var STORAGE_ENABLED = 'trakt_folder_sync_enabled';
     var STORAGE_LOGGING = 'trakt_enable_logging';
 
@@ -18,6 +19,16 @@
     // подставляет trakt-api-key на сервере, поэтому прямой api.trakt.tv без
     // собственного зарегистрированного client_id не подходит. См. SPEC.md.
     var API_URL = 'https://apx.lme.isroot.in/trakt';
+
+    // Задержка между TMDB-обогащениями (чтобы не упираться в лимиты TMDB).
+    var ADD_DELAY_MS = 150;
+
+    // Иконка раздела настроек — простой кружок с буквой T в стиле Trakt.
+    var SECTION_ICON =
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none">' +
+        '<circle cx="24" cy="24" r="22" fill="none" stroke="currentColor" stroke-width="3"/>' +
+        '<path d="M14 14 L24 24 L34 14 M19 29 L29 19" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>' +
+        '</svg>';
 
     // -----------------------------------------------------------------------
     // Утилиты
@@ -94,51 +105,91 @@
     }
 
     // -----------------------------------------------------------------------
-    // Маппинг watchlist-элемента Trakt → карточка Lampa
+    // Маппинг watchlist-элемента Trakt → карточка Lampa (тощая)
     // -----------------------------------------------------------------------
     //
     // Watchlist-элемент: { type: 'movie'|'show', listed_at, movie|show: {
     //   ids: { trakt, slug, imdb, tmdb }, title, year, ... } }
     //
-    // Lampa.Favorite.add ожидает объект с минимум id, title, method/card_type.
-    // Без TMDB-обогащения получим скромную карточку без постера — это
-    // приемлемо для первого прохода; обогащение TMDB будет в коммите 4+.
+    // Эта карточка — только каркас. Перед Lampa.Favorite.add она обогащается
+    // данными TMDB (enrichAndAdd) — иначе нет ни постера, ни overview, и
+    // Lampa может перепутать карточку с другой сущностью, у которой тот же
+    // TMDB id (TMDB нумерует фильмы и сериалы независимо).
     //
-    function watchlistItemToCard(item) {
+    function watchlistItemToStub(item) {
         if (!item) return null;
         var media = item.movie || item.show;
         if (!media || !media.ids) return null;
 
         var isMovie = !!item.movie;
-        var id = media.ids.tmdb || media.ids.trakt;
+        var id = media.ids.tmdb;
+        // Без TMDB id не умеем обогатить карточку — пропускаем (не добавляем
+        // мусорные карточки с trakt-id в роли tmdb-id, как было в v0.3.0).
         if (!id) return null;
 
         return {
-            id:             id,
-            ids:            media.ids,
-            title:          media.title || '',
-            original_title: media.title || '',
-            name:           isMovie ? undefined : (media.title || ''),
-            release_date:   media.year ? String(media.year) : '',
-            first_air_date: media.year && !isMovie ? String(media.year) : '',
-            vote_average:   Number(media.rating || 0),
-            method:         isMovie ? 'movie' : 'tv',
-            card_type:      isMovie ? 'movie' : 'tv',
-            source:         'tmdb'
+            id:         id,
+            ids:        media.ids,
+            title:      media.title || '',
+            year:       media.year || undefined,
+            method:     isMovie ? 'movie' : 'tv',
+            card_type:  isMovie ? 'movie' : 'tv'
         };
+    }
+
+    // -----------------------------------------------------------------------
+    // Обогащение карточки данными TMDB и добавление в Lampa.Favorite
+    // -----------------------------------------------------------------------
+    //
+    // Берёт тощую карточку (id, method, ids), делает запрос к TMDB за полными
+    // данными (название на языке пользователя, постер, overview, год и т.д.)
+    // и кладёт результат в папку. При ошибке TMDB — добавляет что есть,
+    // чтобы карточка хоть как-то появилась.
+    //
+    function enrichAndAdd(folder, stub, onDone) {
+        var id = tmdbId(stub);
+        if (!id) {
+            // Не должно случаться — watchlistItemToStub уже отсеивает такие.
+            if (onDone) onDone();
+            return;
+        }
+
+        var type = stub.method === 'movie' ? 'movie' : 'tv';
+        var lang = Lampa.Storage.get('language', 'ru');
+        var url  = Lampa.TMDB.api(type + '/' + id + '?api_key=' + Lampa.TMDB.key() + '&language=' + lang);
+
+        var network = new Lampa.Reguest();
+        network.silent(url, function (data) {
+            // data — полный объект TMDB (title/name, poster_path, overview, ...).
+            // Накрываем поверх наши сохранённые идентификаторы и method.
+            var enriched = Object.assign({}, stub, data, {
+                ids:       stub.ids,
+                method:    stub.method,
+                card_type: stub.card_type,
+                id:        id,
+                source:    'tmdb'
+            });
+            // Для сериалов TMDB возвращает name; Lampa ждёт title.
+            if (type === 'tv' && enriched.name && !enriched.title) {
+                enriched.title = enriched.name;
+            }
+            try { Lampa.Favorite.add(folder, enriched); }
+            catch (e) { warn('Favorite.add err', e); }
+            if (onDone) onDone();
+        }, function (err) {
+            warn('TMDB enrich failed', { id: id, type: type, err: err });
+            // Падать полностью не хотим — кладём тощую карточку, будет хотя бы
+            // заглушка; при следующей синхронизации попробуем ещё раз.
+            try { Lampa.Favorite.add(folder, stub); }
+            catch (e) { warn('Favorite.add fallback err', e); }
+            if (onDone) onDone();
+        });
     }
 
     // -----------------------------------------------------------------------
     // Синхронизация папки book
     // -----------------------------------------------------------------------
-    //
-    // Поток: читаем watchlist (movies + shows) → строим множество желаемых
-    // карточек → сравниваем с текущим состоянием Lampa.Favorite type='book'
-    // → добавляем/удаляем разницу.
-    //
-    // Trakt — источник правды. Если пользователь удалил из watchlist на
-    // трэкт-сайте, мы убираем и из Закладок Lampa.
-    //
+
     var _syncingBook = false;
 
     function syncBook() {
@@ -156,52 +207,71 @@
             var rawItems = (Array.isArray(results[0]) ? results[0] : [])
                      .concat(Array.isArray(results[1]) ? results[1] : []);
 
-            // Собираем желаемые карточки
+            // Строим желаемое множество — тощие карточки с TMDB id.
             var desired = [];
             var desiredIds = new Set();
             rawItems.forEach(function (it) {
-                var card = watchlistItemToCard(it);
-                if (!card) return;
-                var id = tmdbId(card);
+                var stub = watchlistItemToStub(it);
+                if (!stub) return;
+                var id = tmdbId(stub);
                 if (!id || desiredIds.has(id)) return;
                 desiredIds.add(id);
-                desired.push(card);
+                desired.push(stub);
             });
 
             // Текущее состояние папки
             var local = Lampa.Favorite.get({ type: 'book' }) || [];
             var localIds = new Set(local.map(tmdbId).filter(Boolean));
 
-            // Добавить: есть в Trakt, нет в Lampa
+            // Что добавить: есть в Trakt, нет в Lampa
             var toAdd = desired.filter(function (c) { return !localIds.has(tmdbId(c)); });
 
-            // Удалить: есть в Lampa, нет в Trakt
+            // Что удалить: есть в Lampa, нет в Trakt
             var toRemove = local.filter(function (c) {
                 var id = tmdbId(c);
                 return id && !desiredIds.has(id);
             });
 
+            // Удаления — мгновенно, без обогащения
             toRemove.forEach(function (card) {
                 try { Lampa.Favorite.remove('book', card); }
                 catch (e) { warn('remove err', e); }
             });
-            toAdd.forEach(function (card) {
-                try { Lampa.Favorite.add('book', card); }
-                catch (e) { warn('add err', e); }
-            });
 
-            log('syncBook: готово', {
-                traktCount: desired.length,
-                added: toAdd.length,
-                removed: toRemove.length
-            });
+            // Добавления — последовательно, с TMDB-обогащением и задержкой
+            var added = 0;
+            function addNext(index) {
+                if (index >= toAdd.length) {
+                    log('syncBook: готово', {
+                        traktCount: desired.length,
+                        added: added,
+                        removed: toRemove.length
+                    });
+                    _syncingBook = false;
+                    return;
+                }
+                enrichAndAdd('book', toAdd[index], function () {
+                    added++;
+                    setTimeout(function () { addNext(index + 1); }, ADD_DELAY_MS);
+                });
+            }
+
+            if (!toAdd.length) {
+                log('syncBook: готово', {
+                    traktCount: desired.length,
+                    added: 0,
+                    removed: toRemove.length
+                });
+                _syncingBook = false;
+            } else {
+                addNext(0);
+            }
         })['catch'](function (err) {
             warn('syncBook failed', {
                 status: err && err.status,
                 message: err && err.message,
                 response: err && err.response
             });
-        }).then(function () {
             _syncingBook = false;
         });
     }
@@ -221,13 +291,19 @@
     }
 
     // -----------------------------------------------------------------------
-    // Настройки
+    // Настройки — свой раздел, не подмешиваемся в «Trakt» от lampame.
     // -----------------------------------------------------------------------
 
     function addSettings() {
-        // Заголовок панели с версией — первым пунктом, над переключателем.
+        Lampa.SettingsApi.addComponent({
+            component: COMPONENT,
+            name:      'Trakt Folder Sync',
+            icon:      SECTION_ICON
+        });
+
+        // Заголовок с версией — первым пунктом.
         Lampa.SettingsApi.addParam({
-            component: 'trakt',
+            component: COMPONENT,
             param: { name: 'trakt_folder_sync_header', type: 'static' },
             field: { name: '' },
             onRender: function (item) {
@@ -241,7 +317,7 @@
         });
 
         Lampa.SettingsApi.addParam({
-            component: 'trakt',
+            component: COMPONENT,
             param: { name: STORAGE_ENABLED, type: 'trigger', 'default': true },
             field: {
                 name: 'Синхронизация папок с Trakt',
