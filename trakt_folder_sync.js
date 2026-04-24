@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.4.2';
+    var VERSION         = '0.5.0';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // Не создаём свой компонент — подмешиваем параметры в уже существующий
@@ -18,6 +18,7 @@
     var COMPONENT       = 'trakt';
     var STORAGE_ENABLED = 'trakt_folder_sync_enabled';
     var STORAGE_LOGGING = 'trakt_enable_logging';
+    var STORAGE_PENDING = 'trakt_folder_sync_pending';
 
     // Базовый URL — тот же прокси, что использует trakt_by_lampame. Прокси
     // подставляет trakt-api-key на сервере, поэтому прямой api.trakt.tv без
@@ -26,6 +27,17 @@
 
     // Задержка между TMDB-обогащениями (чтобы не упираться в лимиты TMDB).
     var ADD_DELAY_MS = 150;
+
+    // Окно, в течение которого Pending Ops перекрывают состояние Trakt.
+    // Trakt API отдаёт устаревшие данные 5–15 минут после записи — в это
+    // время действие пользователя не должно откатываться синхронизацией.
+    // См. SPEC.md § «Задержки Trakt API и механизм Pending Ops».
+    var PENDING_TTL_SEC = 15 * 60;
+
+    // Таймаут «страховки» для _ownOps: если событие от Favorite не пришло
+    // по какой-то причине, метка всё равно очистится и не будет мешать
+    // последующим реальным действиям пользователя.
+    var OWN_OPS_TIMEOUT_MS = 10000;
 
     // -----------------------------------------------------------------------
     // Утилиты
@@ -57,6 +69,98 @@
         if (!card) return null;
         var id = (card.ids && card.ids.tmdb) || card.id;
         return id != null ? String(id) : null;
+    }
+
+    // Определяем тип карточки (movie/show) для Trakt API.
+    // У наших «тощих» карточек есть card_type/method. У карточек, которые
+    // пользователь добавил сам из поиска/раздела TMDB, достоверно сигналят:
+    // name (только у TV) vs title, first_air_date vs release_date,
+    // number_of_seasons. В крайнем случае падаем обратно на movie.
+    function cardIsShow(card) {
+        if (!card) return false;
+        if (card.method === 'tv' || card.card_type === 'tv') return true;
+        if (card.media_type === 'tv') return true;
+        if (card.number_of_seasons != null) return true;
+        if (card.first_air_date && !card.release_date) return true;
+        if (card.name && !card.title) return true;
+        return false;
+    }
+
+    // -----------------------------------------------------------------------
+    // Pending Ops — буфер под задержку Trakt API
+    // -----------------------------------------------------------------------
+    //
+    // После каждой успешной записи в Trakt кладём сюда запись
+    // { id, type, folder, action, ts }. На syncBook-е накладываем эти записи
+    // поверх diff'а: pending add → не удалять, pending remove → не добавлять.
+    // По истечении PENDING_TTL_SEC запись протухает сама.
+
+    function loadPendingOps() {
+        var raw;
+        try { raw = Lampa.Storage.get(STORAGE_PENDING, '[]'); }
+        catch (e) { return []; }
+        var arr;
+        try { arr = typeof raw === 'string' ? JSON.parse(raw) : raw; }
+        catch (e) { return []; }
+        if (!Array.isArray(arr)) return [];
+
+        var cutoff = Math.floor(Date.now() / 1000) - PENDING_TTL_SEC;
+        var fresh  = arr.filter(function (op) {
+            return op && op.id && op.action && op.ts && op.ts >= cutoff;
+        });
+        // Протухшие — вычищаем из хранилища сразу.
+        if (fresh.length !== arr.length) {
+            try { Lampa.Storage.set(STORAGE_PENDING, fresh); } catch (e) {}
+        }
+        return fresh;
+    }
+
+    function addPendingOp(op) {
+        if (!op || !op.id || !op.folder || !op.action) return;
+        var ops = loadPendingOps();
+        // Дубликаты (id+folder+action) заменяем свежим ts.
+        ops = ops.filter(function (x) {
+            return !(x.id === op.id && x.folder === op.folder && x.action === op.action);
+        });
+        ops.push({
+            id:     String(op.id),
+            type:   op.type || 'movie',
+            folder: op.folder,
+            action: op.action,
+            ts:     Math.floor(Date.now() / 1000)
+        });
+        try { Lampa.Storage.set(STORAGE_PENDING, ops); } catch (e) {}
+        log('pending op сохранён', op);
+    }
+
+    // -----------------------------------------------------------------------
+    // _ownOps — защита от петли собственных записей в Lampa.Favorite
+    // -----------------------------------------------------------------------
+    //
+    // syncBook вызывает Lampa.Favorite.add/remove, которые рожают события
+    // на Favorite.listener — те же события слушает наш favorite-listener,
+    // и без защиты каждая наша синхронизация порождала бы write-запрос в
+    // Trakt, размножая действия пользователя.
+
+    var _ownOps = new Set();
+
+    function markOwn(id) {
+        if (!id) return;
+        id = String(id);
+        _ownOps.add(id);
+        // Если событие по какой-то причине не пришло — снимаем метку сами,
+        // чтобы реальное действие пользователя через 11 секунд отработало.
+        setTimeout(function () { _ownOps['delete'](id); }, OWN_OPS_TIMEOUT_MS);
+    }
+
+    function consumeOwn(id) {
+        if (!id) return false;
+        id = String(id);
+        if (_ownOps.has(id)) {
+            _ownOps['delete'](id);
+            return true;
+        }
+        return false;
     }
 
     // -----------------------------------------------------------------------
@@ -170,6 +274,7 @@
             if (type === 'tv' && enriched.name && !enriched.title) {
                 enriched.title = enriched.name;
             }
+            markOwn(id);
             try { Lampa.Favorite.add(folder, enriched); }
             catch (e) { warn('Favorite.add err', e); }
             if (onDone) onDone();
@@ -177,6 +282,7 @@
             warn('TMDB enrich failed', { id: id, type: type, err: err });
             // Падать полностью не хотим — кладём тощую карточку, будет хотя бы
             // заглушка; при следующей синхронизации попробуем ещё раз.
+            markOwn(id);
             try { Lampa.Favorite.add(folder, stub); }
             catch (e) { warn('Favorite.add fallback err', e); }
             if (onDone) onDone();
@@ -229,8 +335,35 @@
                 return id && !desiredIds.has(id);
             });
 
-            // Удаления — мгновенно, без обогащения
+            // Накладываем Pending Ops: то, что пользователь только что
+            // сделал в Lampa, не должно откатываться из-за того, что Trakt
+            // ещё не пересчитал watchlist. SPEC.md § «Pending Ops».
+            var pending = loadPendingOps().filter(function (op) {
+                return op.folder === 'book';
+            });
+            if (pending.length) {
+                var pendingAdd    = new Set();
+                var pendingRemove = new Set();
+                pending.forEach(function (op) {
+                    if (op.action === 'add')    pendingAdd.add(op.id);
+                    if (op.action === 'remove') pendingRemove.add(op.id);
+                });
+                // pending add → пользователь только что добавил: не трогать локально
+                toRemove = toRemove.filter(function (c) { return !pendingAdd.has(tmdbId(c)); });
+                // pending remove → пользователь только что удалил: не возвращать
+                toAdd    = toAdd.filter(function (c)   { return !pendingRemove.has(tmdbId(c)); });
+                log('pending ops применены', {
+                    total: pending.length,
+                    add: pendingAdd.size, remove: pendingRemove.size
+                });
+            }
+
+            // Удаления — мгновенно, без обогащения.
+            // markOwn — чтобы собственный Favorite.remove не улетел обратно
+            // в Trakt через favorite-listener как действие пользователя.
             toRemove.forEach(function (card) {
+                var rid = tmdbId(card);
+                if (rid) markOwn(rid);
                 try { Lampa.Favorite.remove('book', card); }
                 catch (e) { warn('remove err', e); }
             });
@@ -270,6 +403,82 @@
                 response: err && err.response
             });
             _syncingBook = false;
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Write-путь: действия пользователя → Trakt API
+    // -----------------------------------------------------------------------
+    //
+    // SPEC.md § «Ручные действия пользователя».
+    // book ↔ Trakt Watchlist — единственная двусторонняя папка в текущей
+    // версии. Добавление/удаление карточки в Lampa отправляем в Trakt
+    // через POST /sync/watchlist[/remove], затем кладём Pending Op.
+
+    function buildWatchlistBody(card) {
+        var id = tmdbId(card);
+        if (!id) return null;
+        var isShow = cardIsShow(card);
+        var entry  = { ids: { tmdb: Number(id) } };
+        var body   = {};
+        body[isShow ? 'shows' : 'movies'] = [entry];
+        return { body: body, type: isShow ? 'show' : 'movie', id: id };
+    }
+
+    function pushWatchlist(action, card) {
+        if (!hasToken()) return;
+        var built = buildWatchlistBody(card);
+        if (!built) { warn('pushWatchlist: нет tmdb id', card); return; }
+
+        var path = action === 'remove' ? '/sync/watchlist/remove' : '/sync/watchlist';
+        traktFetch(path, { method: 'POST', body: built.body })
+            .then(function (data) {
+                log('watchlist ' + action + ' ok', { id: built.id, type: built.type, resp: data });
+                addPendingOp({
+                    id:     built.id,
+                    type:   built.type,
+                    folder: 'book',
+                    action: action
+                });
+            })['catch'](function (err) {
+                warn('watchlist ' + action + ' failed', {
+                    id: built.id, type: built.type,
+                    status: err && err.status, response: err && err.response
+                });
+            });
+    }
+
+    function initFavoriteListener() {
+        if (!Lampa.Favorite || !Lampa.Favorite.listener ||
+            typeof Lampa.Favorite.listener.follow !== 'function') {
+            warn('initFavoriteListener: Lampa.Favorite.listener недоступен');
+            return;
+        }
+
+        Lampa.Favorite.listener.follow('add', function (e) {
+            if (!e || !e.where || !e.card) return;
+            if (e.where !== 'book') return;
+            var id = tmdbId(e.card);
+            if (consumeOwn(id)) {
+                log('Favorite.add — пропуск своей же операции', { id: id });
+                return;
+            }
+            if (!isEnabled()) return;
+            log('Favorite.add пользователем → Trakt', { id: id });
+            pushWatchlist('add', e.card);
+        });
+
+        Lampa.Favorite.listener.follow('remove', function (e) {
+            if (!e || !e.where || !e.card) return;
+            if (e.where !== 'book') return;
+            var id = tmdbId(e.card);
+            if (consumeOwn(id)) {
+                log('Favorite.remove — пропуск своей же операции', { id: id });
+                return;
+            }
+            if (!isEnabled()) return;
+            log('Favorite.remove пользователем → Trakt', { id: id });
+            pushWatchlist('remove', e.card);
         });
     }
 
@@ -328,6 +537,7 @@
         }
 
         log('Готов', { version: VERSION, enabled: isEnabled() });
+        initFavoriteListener();
         initActivityListener();
     }
 
