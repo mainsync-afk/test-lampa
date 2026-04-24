@@ -15,7 +15,7 @@
     var STORAGE_LIST_NAME    = 'trakt_sync_thrown_list_name';
     var STORAGE_ENABLED      = 'trakt_folder_sync_enabled';
     var STORAGE_LOOK_DAYS    = 'trakt_sync_look_days';
-    var DEFAULT_LOOK_DAYS    = 30;
+    var DEFAULT_LOOK_DAYS    = 0; // 0 = без ограничений
     var STORAGE_TRAKT_ID_MAP = 'trakt_id_map';
     var TRAKT_PROXY          = 'https://apx.lme.isroot.in/trakt';
 
@@ -224,11 +224,15 @@
             });
         }
         if (folder === 'look') {
-            var days = parseInt(Lampa.Storage.get(STORAGE_LOOK_DAYS) || DEFAULT_LOOK_DAYS, 10) || DEFAULT_LOOK_DAYS;
-            var cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+            var raw = Lampa.Storage.get(STORAGE_LOOK_DAYS);
+            var days = raw === undefined || raw === null ? DEFAULT_LOOK_DAYS : parseInt(raw, 10);
+            if (isNaN(days)) days = DEFAULT_LOOK_DAYS;
             return fetchPages(function (p) {
                 return api.upnext({ page: p, limit: 100 });
             }).then(function (items) {
+                // days <= 0 — без ограничений, отдаём всё, что Trakt считает upnext
+                if (days <= 0) return items;
+                var cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
                 return items.filter(function (item) {
                     var lastWatched = item.trakt_upnext_last_watched_at;
                     if (!lastWatched) return false;
@@ -468,11 +472,11 @@
                 name: STORAGE_LOOK_DAYS,
                 type: 'select',
                 'default': String(DEFAULT_LOOK_DAYS),
-                values: { '7': '7 дней', '14': '14 дней', '30': '30 дней', '60': '60 дней', '90': '90 дней' }
+                values: { '0': 'Без ограничений', '1': '1 день (отладка)' }
             },
             field: {
                 name: 'Период синхронизации папки "Смотрю"',
-                description: 'Сериалы просмотренные за указанный период попадают в папку Смотрю'
+                description: 'Без ограничений — все сериалы из upnext Trakt. 1 день — только просмотренные за последние сутки (для отладки).'
             }
         });
 
