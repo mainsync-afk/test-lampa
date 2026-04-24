@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.5.1';
+    var VERSION         = '0.5.2';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // Не создаём свой компонент — подмешиваем параметры в уже существующий
@@ -78,10 +78,15 @@
     }
 
     // Определяем тип карточки (movie/show) для Trakt API.
-    // У наших «тощих» карточек есть card_type/method. У карточек, которые
-    // пользователь добавил сам из поиска/раздела TMDB, достоверно сигналят:
-    // name (только у TV) vs title, first_air_date vs release_date,
-    // number_of_seasons. В крайнем случае падаем обратно на movie.
+    // Используется только для информативных логов и для watchlistItemToStub.
+    // В write-пути тип НЕ угадываем — отправляем в Trakt оба массива сразу
+    // (movies и shows) и читаем фактический тип из ответа. TMDB id
+    // namespaced per type, поэтому в watchlist попадёт ровно один из двух,
+    // а другой окажется в not_found — см. pushWatchlist.
+    //
+    // До v0.5.1 эта эвристика использовалась для формирования POST-body
+    // и давала ложные movie для «тощих» карточек от парных событий Lampa,
+    // из-за чего сериалы молча не добавлялись в Trakt (тикет 2026-04-24).
     function cardIsShow(card) {
         if (!card) return false;
         if (card.method === 'tv' || card.card_type === 'tv') return true;
@@ -427,14 +432,32 @@
     // версии. Добавление/удаление карточки в Lampa отправляем в Trakt
     // через POST /sync/watchlist[/remove], затем кладём Pending Op.
 
+    // Собираем body для /sync/watchlist[/remove].
+    // Отправляем id СРАЗУ в обоих массивах — movies и shows. TMDB id
+    // namespaced per type, так что Trakt найдёт ровно одну сущность;
+    // лишний объект уйдёт в not_found и проигнорируется.
+    // Фактический тип определяется по полю added/deleted в ответе —
+    // см. pushWatchlist. Эвристика cardIsShow оставлена только для
+    // предварительного лога и в write-пути больше не используется.
     function buildWatchlistBody(card) {
         var id = tmdbId(card);
         if (!id) return null;
-        var isShow = cardIsShow(card);
-        var entry  = { ids: { tmdb: Number(id) } };
-        var body   = {};
-        body[isShow ? 'shows' : 'movies'] = [entry];
-        return { body: body, type: isShow ? 'show' : 'movie', id: id };
+        var entry = { ids: { tmdb: Number(id) } };
+        var body  = { movies: [entry], shows: [entry] };
+        return { body: body, guessedType: cardIsShow(card) ? 'show' : 'movie', id: id };
+    }
+
+    // Извлекаем фактический тип (movie/show) из ответа Trakt по /sync/watchlist.
+    // Формат ответа: { added|deleted: { movies: N, shows: N }, ... }
+    // Возвращаем 'movie' | 'show' | null (если ни один из счётчиков не > 0 —
+    // то есть Trakt не нашёл id вообще, скорее всего лежит в not_found).
+    function resolveTypeFromTraktResp(resp, action) {
+        if (!resp) return null;
+        var bucket = resp[action === 'remove' ? 'deleted' : 'added'];
+        if (!bucket) return null;
+        if ((bucket.movies || 0) > 0) return 'movie';
+        if ((bucket.shows  || 0) > 0) return 'show';
+        return null;
     }
 
     // Дедуп исходящих write-запросов. Lampa может эмитить add/remove парно;
@@ -465,16 +488,37 @@
         var path = action === 'remove' ? '/sync/watchlist/remove' : '/sync/watchlist';
         traktFetch(path, { method: 'POST', body: built.body })
             .then(function (data) {
-                log('watchlist ' + action + ' ok', { id: built.id, type: built.type, resp: data });
+                var actualType = resolveTypeFromTraktResp(data, action);
+                if (!actualType) {
+                    // Trakt ответил 200/201, но ни movies, ни shows не
+                    // добавились/удалились — скорее всего id неизвестен
+                    // (not_found) или Trakt посчитал запись уже существующей.
+                    // Для add: проверяем existing как «уже было» — это ок.
+                    var existing = data && data.existing;
+                    if (action === 'add' && existing &&
+                        ((existing.movies || 0) > 0 || (existing.shows || 0) > 0)) {
+                        actualType = (existing.movies || 0) > 0 ? 'movie' : 'show';
+                        log('watchlist add — уже было в Trakt', { id: built.id, type: actualType });
+                    } else {
+                        warn('watchlist ' + action + ' — Trakt не распознал id', {
+                            id: built.id, resp: data
+                        });
+                        return;
+                    }
+                }
+                log('watchlist ' + action + ' ok', {
+                    id: built.id, type: actualType,
+                    guessed: built.guessedType, resp: data
+                });
                 addPendingOp({
                     id:     built.id,
-                    type:   built.type,
+                    type:   actualType,
                     folder: 'book',
                     action: action
                 });
             })['catch'](function (err) {
                 warn('watchlist ' + action + ' failed', {
-                    id: built.id, type: built.type,
+                    id: built.id, guessed: built.guessedType,
                     status: err && err.status, response: err && err.response
                 });
             });
