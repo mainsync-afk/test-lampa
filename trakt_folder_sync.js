@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.7.0';
+    var VERSION         = '0.7.1';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // Не создаём свой компонент — подмешиваем параметры в уже существующий
@@ -467,25 +467,19 @@
         var completed = row.completed || 0;
         var status    = String(row.status || '').toLowerCase();
         if (completed === 0)          return null;        // ни одного просмотра — не статусная
-        if (!row.lastAiredWatched)    return 'look';      // есть непросмотренная вышедшая серия
+        if (!row.caughtUp)            return 'look';      // есть непросмотренная вышедшая серия
         if (status === 'ended' || status === 'canceled') return 'viewed';
         return 'continued';                               // догнал, ждёт новые серии
     }
 
-    // Проверяем, отмечен ли просмотренным конкретно последний вышедший
-    // эпизод (progress.last_episode). Не сравниваем количества — ищем
-    // именно эту серию в progress.seasons[].episodes[].
-    function isLastAiredWatched(progress) {
-        if (!progress || !progress.last_episode) return false;
-        var last = progress.last_episode;
-        var season = (progress.seasons || []).find(function (s) {
-            return s && s.number === last.season;
-        });
-        if (!season) return false;
-        var ep = (season.episodes || []).find(function (e) {
-            return e && e.number === last.number;
-        });
-        return !!(ep && ep.completed);
+    // "Догнан" в терминах Trakt = next_episode == null в /shows/:id/progress/watched.
+    // Это ровно тот же сигнал, по которому Trakt UI кладёт / не кладёт сериал
+    // в Continue Watching. Сравнение количеств aired/completed и проверка
+    // last_episode неверны: last_episode в этом эндпоинте — последняя
+    // ПРОСМОТРЕННАЯ пользователем серия, а не последняя вышедшая.
+    function isCaughtUp(progress) {
+        if (!progress) return false;
+        return !progress.next_episode;
     }
 
     function fetchShowProgress(showKey) {
@@ -518,15 +512,15 @@
                     var show     = p.it.show;
                     var progress = p.progress;
                     var row = {
-                        id:               String(show.ids.tmdb),
-                        ids:              show.ids,
-                        title:            show.title || '',
-                        year:             show.year,
-                        status:           show.status || '',
-                        aired:            progress ? (progress.aired || 0) : 0,
-                        completed:        progress ? (progress.completed || 0) : 0,
-                        lastEpisode:      progress && progress.last_episode,
-                        lastAiredWatched: isLastAiredWatched(progress)
+                        id:          String(show.ids.tmdb),
+                        ids:         show.ids,
+                        title:       show.title || '',
+                        year:        show.year,
+                        status:      show.status || '',
+                        aired:       progress ? (progress.aired || 0) : 0,
+                        completed:   progress ? (progress.completed || 0) : 0,
+                        nextEpisode: progress && progress.next_episode,
+                        caughtUp:    isCaughtUp(progress)
                     };
                     row.folder = classifyShow(row);
                     log('классификация сериала', {
@@ -535,10 +529,10 @@
                         progress_aired:     row.aired,
                         progress_completed: row.completed,
                         show_status:        row.status,
-                        last_episode:       row.lastEpisode
-                            ? 'S' + row.lastEpisode.season + 'E' + row.lastEpisode.number
+                        next_episode:       row.nextEpisode
+                            ? 'S' + row.nextEpisode.season + 'E' + row.nextEpisode.number
                             : null,
-                        last_aired_watched: row.lastAiredWatched,
+                        caught_up:          row.caughtUp,
                         classified_as:      row.folder || '— (completed == 0)'
                     });
                     if (row.folder) rows.push(row);
