@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.5.2';
+    var VERSION         = '0.6.0';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // Не создаём свой компонент — подмешиваем параметры в уже существующий
@@ -424,6 +424,211 @@
     }
 
     // -----------------------------------------------------------------------
+    // Классификация сериалов и синхронизация статусных папок
+    // -----------------------------------------------------------------------
+    //
+    // SPEC.md § «Логика статусов сериала».
+    //
+    // Источник для сериалов — /sync/watched/shows?extended=full.
+    // Оттуда берём:
+    //   • show.status          — returning series | ended | canceled | ...
+    //   • show.aired_episodes  — сколько всего эпизодов вышло (без season 0)
+    //   • seasons[].episodes   — какие эпизоды уже просмотрены пользователем
+    //
+    // Это позволяет посчитать aired/completed из ОДНОГО запроса и не бомбить
+    // Trakt N-раз через /shows/:id/progress/watched (N+1 проблема).
+    //
+    // Фильмы в viewed — /sync/watched/movies (любой plays > 0 = смотрели).
+    // Сериалы идут в look/viewed/continued, фильмы — только в viewed.
+    //
+    // Write-путь у статусных папок в v0.6.0 НЕ реализован. Пользовательская
+    // раскладка по статусам — это реакция на scrobble эпизода в Trakt, а не
+    // ручное перетаскивание карточки в Lampa. Отметка сериала как
+    // «Просмотрено» через /sync/history — задача следующей версии.
+
+    function classifyShow(row) {
+        var completed = row.completed || 0;
+        var aired     = row.aired     || 0;
+        var status    = String(row.status || '').toLowerCase();
+        if (completed === 0) return null;                         // ни одного просмотра
+        if (aired > completed) return 'look';                     // есть непросмотренные
+        // aired <= completed — сериал догнан (или пересмотрен)
+        if (status === 'ended' || status === 'canceled') return 'viewed';
+        return 'continued';                                       // ждём новые серии
+    }
+
+    // Уникальные просмотренные эпизоды (season 0 — specials — не считаем,
+    // show.aired_episodes их тоже не включает, чтобы не разошлось).
+    function countWatchedEpisodes(seasons) {
+        var total = 0;
+        (seasons || []).forEach(function (s) {
+            if (!s || s.number === 0) return;
+            (s.episodes || []).forEach(function (e) {
+                if (e && (e.plays || 0) > 0) total++;
+            });
+        });
+        return total;
+    }
+
+    function fetchShowsClassification() {
+        return traktFetch('/sync/watched/shows?extended=full').then(function (items) {
+            if (!Array.isArray(items)) return [];
+            var rows = [];
+            items.forEach(function (it) {
+                var show = it && it.show;
+                if (!show || !show.ids || !show.ids.tmdb) return;
+                var row = {
+                    id:        String(show.ids.tmdb),
+                    ids:       show.ids,
+                    title:     show.title || '',
+                    year:      show.year,
+                    status:    show.status || '',
+                    aired:     show.aired_episodes || 0,
+                    completed: countWatchedEpisodes(it.seasons)
+                };
+                row.folder = classifyShow(row);
+                if (row.folder) rows.push(row);
+            });
+            return rows;
+        });
+    }
+
+    function fetchWatchedMovies() {
+        return traktFetch('/sync/watched/movies').then(function (items) {
+            if (!Array.isArray(items)) return [];
+            var rows = [];
+            items.forEach(function (it) {
+                var m = it && it.movie;
+                if (!m || !m.ids || !m.ids.tmdb) return;
+                rows.push({
+                    id:    String(m.ids.tmdb),
+                    ids:   m.ids,
+                    title: m.title || '',
+                    year:  m.year
+                });
+            });
+            return rows;
+        });
+    }
+
+    function computeStatusFolders() {
+        return Promise.all([fetchShowsClassification(), fetchWatchedMovies()])
+            .then(function (results) {
+                var shows  = results[0];
+                var movies = results[1];
+
+                var desired = { look: [], viewed: [], continued: [] };
+
+                shows.forEach(function (row) {
+                    desired[row.folder].push({
+                        id:        row.id,
+                        ids:       row.ids,
+                        title:     row.title,
+                        year:      row.year,
+                        method:    'tv',
+                        card_type: 'tv'
+                    });
+                });
+
+                movies.forEach(function (m) {
+                    desired.viewed.push({
+                        id:        m.id,
+                        ids:       m.ids,
+                        title:     m.title,
+                        year:      m.year,
+                        method:    'movie',
+                        card_type: 'movie'
+                    });
+                });
+
+                return desired;
+            });
+    }
+
+    function syncStatusFolder(folder, desiredList) {
+        return new Promise(function (resolve) {
+            var desiredIds = new Set(desiredList.map(function (s) { return String(s.id); }));
+            var local      = Lampa.Favorite.get({ type: folder }) || [];
+            var localIds   = new Set(local.map(tmdbId).filter(Boolean));
+
+            var toAdd    = desiredList.filter(function (s) { return !localIds.has(String(s.id)); });
+            var toRemove = local.filter(function (c) {
+                var id = tmdbId(c);
+                return id && !desiredIds.has(id);
+            });
+
+            // Удаляем то, что больше не должно быть в папке. markOwn — потому
+            // что listener всё равно посмотрит на where и наш обработчик для
+            // book проигнорирует, но защита на будущее не повредит.
+            toRemove.forEach(function (card) {
+                var rid = tmdbId(card);
+                if (rid) markOwn(rid);
+                try { Lampa.Favorite.remove(folder, card); }
+                catch (e) { warn(folder + ' remove err', e); }
+            });
+
+            function done() {
+                log('syncStatusFolder: готово', {
+                    folder: folder,
+                    desired: desiredList.length,
+                    added: toAdd.length,
+                    removed: toRemove.length
+                });
+                resolve();
+            }
+
+            if (!toAdd.length) { done(); return; }
+
+            var i = 0;
+            function step() {
+                if (i >= toAdd.length) { done(); return; }
+                // markOwn ставится внутри enrichAndAdd перед Favorite.add.
+                // Для статусной папки Lampa может сама снять карточку с
+                // другого статуса (look→continued и т.п.), — метка накроет
+                // сопутствующий remove-event.
+                enrichAndAdd(folder, toAdd[i], function () {
+                    i++;
+                    setTimeout(step, ADD_DELAY_MS);
+                });
+            }
+            step();
+        });
+    }
+
+    var _syncingStatus = false;
+
+    function syncStatusFolders() {
+        if (_syncingStatus) { log('syncStatusFolders: уже идёт, пропуск'); return; }
+        if (!isEnabled()) { log('syncStatusFolders: синхронизация отключена'); return; }
+        if (!hasToken())  { log('syncStatusFolders: нет токена');            return; }
+        _syncingStatus = true;
+        log('syncStatusFolders: старт');
+
+        computeStatusFolders().then(function (desired) {
+            log('статусы рассчитаны', {
+                look:      desired.look.length,
+                viewed:    desired.viewed.length,
+                continued: desired.continued.length
+            });
+            return Promise.all([
+                syncStatusFolder('look',      desired.look),
+                syncStatusFolder('viewed',    desired.viewed),
+                syncStatusFolder('continued', desired.continued)
+            ]);
+        }).then(function () {
+            _syncingStatus = false;
+            log('syncStatusFolders: готово');
+        })['catch'](function (err) {
+            warn('syncStatusFolders failed', {
+                status:   err && err.status,
+                message:  err && err.message,
+                response: err && err.response
+            });
+            _syncingStatus = false;
+        });
+    }
+
+    // -----------------------------------------------------------------------
     // Write-путь: действия пользователя → Trakt API
     // -----------------------------------------------------------------------
     //
@@ -567,8 +772,9 @@
             if (!e || e.type !== 'start') return;
             var activity = e.object || {};
             if (activity.component !== 'bookmarks') return;
-            log('bookmarks открыт → syncBook');
+            log('bookmarks открыт → syncBook + syncStatusFolders');
             syncBook();
+            syncStatusFolders();
         });
     }
 
