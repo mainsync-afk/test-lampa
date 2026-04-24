@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.8.0';
+    var VERSION         = '0.8.1';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
@@ -901,6 +901,39 @@
             });
     }
 
+    // Возвращает 'show' | 'movie' | null. Сперва смотрим явные поля карточки;
+    // если их нет (тощая карточка от парного события Lampa — см. v0.5.2 для
+    // такого же бага в book) — спрашиваем Trakt. Эвристика «нет признаков
+    // сериала → значит фильм» неверна: Lampa иногда отдаёт в листенер карточку
+    // без method/card_type/number_of_seasons — см. лог, где Breaking Bad
+    // (сериал, tmdb 1396) пришёл без всякой типизации и был принят за фильм.
+    function resolveCardType(card) {
+        if (!card) return Promise.resolve(null);
+
+        var m = card.method || card.card_type || card.media_type;
+        if (m === 'tv')    return Promise.resolve('show');
+        if (m === 'movie') return Promise.resolve('movie');
+        if (card.number_of_seasons != null) return Promise.resolve('show');
+
+        var id = tmdbId(card);
+        if (!id) return Promise.resolve(null);
+
+        return traktFetch('/search/tmdb/' + id)
+            .then(function (results) {
+                if (!Array.isArray(results) || !results.length) return null;
+                // Если tmdb id совпадает и с шоу, и с фильмом (редко, но бывает),
+                // отдаём приоритет show — в Lampa статусные папки в подавляющем
+                // большинстве случаев оперируют сериалами.
+                if (results.some(function (r) { return r && r.type === 'show'; }))  return 'show';
+                if (results.some(function (r) { return r && r.type === 'movie'; })) return 'movie';
+                return null;
+            })
+            ['catch'](function (err) {
+                warn('resolveCardType search failed', { tmdb: id, err: err && err.message });
+                return null;
+            });
+    }
+
     function postHistoryMovie(action, id) {
         var body = { movies: [{ ids: { tmdb: Number(id) } }] };
         var path = action === 'remove' ? '/sync/history/remove' : '/sync/history';
@@ -999,32 +1032,6 @@
         if (!id) { warn('pushHistory: нет tmdb id', card); return; }
         if (checkWriteDedup(action, folder, id)) return;
 
-        var isShow = cardIsShow(card);
-
-        if (folder === 'viewed') {
-            if (isShow) postHistoryAllAired(action, card, id);
-            else        postHistoryMovie(action, id);
-            return;
-        }
-
-        if (folder === 'look') {
-            if (!isShow) {
-                log('look для фильма — невозможно в модели Trakt, игнорируем',
-                    { id: id, action: action });
-                return;
-            }
-            if (action === 'add') {
-                postHistoryMarkFirst(id);
-                return;
-            }
-            // remove из look — производное состояние, которое мы не можем
-            // «снять» одним действием (нужно было бы снимать историю всего
-            // что отсмотрено). На следующей синхронизации классификатор
-            // вернёт карточку туда, где ей место по данным Trakt.
-            log('remove из look — no-op (производная папка)', { id: id });
-            return;
-        }
-
         if (folder === 'continued') {
             // continued — производная «догнан + выходит». Пользователь
             // не может её проставить напрямую: нет действия, которое бы это
@@ -1032,6 +1039,37 @@
             // в зависимости от статуса сериала — это уже покрыто viewed-путём).
             log('continued — производная папка, игнорируем действие',
                 { id: id, action: action });
+            return;
+        }
+
+        if (folder === 'look') {
+            if (action === 'remove') {
+                // remove из look — производное состояние, которое мы не можем
+                // «снять» одним действием (нужно было бы снимать историю всего
+                // что отсмотрено). На следующей синхронизации классификатор
+                // вернёт карточку туда, где ей место по данным Trakt.
+                log('remove из look — no-op (производная папка)', { id: id });
+                return;
+            }
+            // look в Trakt-модели существует только для сериалов. Тип карточки
+            // НЕ проверяем: Lampa в листенер часто отдаёт тощую карточку, где
+            // ни method, ни card_type, ни number_of_seasons не выставлены
+            // (см. лог 2026-04-25 — Breaking Bad tmdb=1396 пришёл без типизации
+            // и был принят за фильм). Постим S01E01 безусловно — если тмдб id
+            // принадлежит фильму, Trakt просто ничего не сделает с seasons.
+            postHistoryMarkFirst(id);
+            return;
+        }
+
+        if (folder === 'viewed') {
+            // Резолвим тип через Trakt, а не по полям карточки: тощая карточка
+            // от Lampa тоже актуальна тут (см. коммент выше про look).
+            resolveCardType(card).then(function (type) {
+                if (type === 'show')  { postHistoryAllAired(action, card, id); return; }
+                if (type === 'movie') { postHistoryMovie(action, id);           return; }
+                warn('pushHistory viewed: не удалось определить тип карточки',
+                    { id: id, action: action });
+            });
             return;
         }
     }
