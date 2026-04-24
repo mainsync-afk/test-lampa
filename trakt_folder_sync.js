@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.6.1';
+    var VERSION         = '0.7.0';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // Не создаём свой компонент — подмешиваем параметры в уже существующий
@@ -436,67 +436,115 @@
     //
     // SPEC.md § «Логика статусов сериала».
     //
-    // Источник для сериалов — /sync/watched/shows?extended=full.
-    // Оттуда берём:
-    //   • show.status          — returning series | ended | canceled | ...
-    //   • show.aired_episodes  — сколько всего эпизодов вышло (без season 0)
-    //   • seasons[].episodes   — какие эпизоды уже просмотрены пользователем
+    // Решающий сигнал — ПРОСМОТРЕНА ЛИ ПОСЛЕДНЯЯ ВЫШЕДШАЯ СЕРИЯ
+    // (not: сравнение количества вышло/просмотрено). Это важно, потому
+    // что пользователь может пропустить серию в середине: «смотрел 1,3,5»
+    // — количественно 3<5, но с точки зрения «что можно смотреть сейчас»
+    // сериал догнан (следующая серия ещё не вышла). Trakt UI использует
+    // ту же семантику, и это соответствует ожиданиям пользователя.
     //
-    // Это позволяет посчитать aired/completed из ОДНОГО запроса и не бомбить
-    // Trakt N-раз через /shows/:id/progress/watched (N+1 проблема).
+    // Источник данных — на каждый сериал запрос
+    // /shows/:trakt_id/progress/watched. В ответе:
+    //   • last_episode            — последняя вышедшая (season, number)
+    //   • seasons[].episodes[]    — с флагом completed для каждой серии
+    //   • aired, completed        — счётчики (используем только для логов)
+    // Status сериала (returning series / ended / canceled / ...) берём
+    // из /sync/watched/shows?extended=full, там он уже есть.
+    //
+    // Цена: 1 запрос /sync/watched/shows + N запросов /shows/:id/progress
+    // (параллельно через Promise.all). Для типичного watched-списка в
+    // десятки шоу это ~20–40 HTTP-вызовов — укладывается в Trakt
+    // rate limit 1000/5мин с запасом.
     //
     // Фильмы в viewed — /sync/watched/movies (любой plays > 0 = смотрели).
     // Сериалы идут в look/viewed/continued, фильмы — только в viewed.
     //
-    // Write-путь у статусных папок в v0.6.0 НЕ реализован. Пользовательская
-    // раскладка по статусам — это реакция на scrobble эпизода в Trakt, а не
-    // ручное перетаскивание карточки в Lampa. Отметка сериала как
-    // «Просмотрено» через /sync/history — задача следующей версии.
+    // Write-путь у статусных папок не реализован: отметка серий
+    // просмотренными делается сторонним плагином scrobbling'ом, мы лишь
+    // отражаем итоговую раскладку.
 
     function classifyShow(row) {
         var completed = row.completed || 0;
-        var aired     = row.aired     || 0;
         var status    = String(row.status || '').toLowerCase();
-        if (completed === 0) return null;                         // ни одного просмотра
-        if (aired > completed) return 'look';                     // есть непросмотренные
-        // aired <= completed — сериал догнан (или пересмотрен)
+        if (completed === 0)          return null;        // ни одного просмотра — не статусная
+        if (!row.lastAiredWatched)    return 'look';      // есть непросмотренная вышедшая серия
         if (status === 'ended' || status === 'canceled') return 'viewed';
-        return 'continued';                                       // ждём новые серии
+        return 'continued';                               // догнал, ждёт новые серии
     }
 
-    // Уникальные просмотренные эпизоды (season 0 — specials — не считаем,
-    // show.aired_episodes их тоже не включает, чтобы не разошлось).
-    function countWatchedEpisodes(seasons) {
-        var total = 0;
-        (seasons || []).forEach(function (s) {
-            if (!s || s.number === 0) return;
-            (s.episodes || []).forEach(function (e) {
-                if (e && (e.plays || 0) > 0) total++;
-            });
+    // Проверяем, отмечен ли просмотренным конкретно последний вышедший
+    // эпизод (progress.last_episode). Не сравниваем количества — ищем
+    // именно эту серию в progress.seasons[].episodes[].
+    function isLastAiredWatched(progress) {
+        if (!progress || !progress.last_episode) return false;
+        var last = progress.last_episode;
+        var season = (progress.seasons || []).find(function (s) {
+            return s && s.number === last.season;
         });
-        return total;
+        if (!season) return false;
+        var ep = (season.episodes || []).find(function (e) {
+            return e && e.number === last.number;
+        });
+        return !!(ep && ep.completed);
+    }
+
+    function fetchShowProgress(showKey) {
+        return traktFetch('/shows/' + encodeURIComponent(showKey) + '/progress/watched')
+            ['catch'](function (err) {
+                warn('progress failed', {
+                    show: showKey,
+                    status: err && err.status,
+                    message: err && err.message
+                });
+                return null;
+            });
     }
 
     function fetchShowsClassification() {
         return traktFetch('/sync/watched/shows?extended=full').then(function (items) {
             if (!Array.isArray(items)) return [];
-            var rows = [];
-            items.forEach(function (it) {
-                var show = it && it.show;
-                if (!show || !show.ids || !show.ids.tmdb) return;
-                var row = {
-                    id:        String(show.ids.tmdb),
-                    ids:       show.ids,
-                    title:     show.title || '',
-                    year:      show.year,
-                    status:    show.status || '',
-                    aired:     show.aired_episodes || 0,
-                    completed: countWatchedEpisodes(it.seasons)
-                };
-                row.folder = classifyShow(row);
-                if (row.folder) rows.push(row);
+            var valid = items.filter(function (it) {
+                return it && it.show && it.show.ids
+                    && it.show.ids.tmdb && it.show.ids.trakt;
             });
-            return rows;
+            // N+1: один progress-запрос на сериал. Параллельно.
+            return Promise.all(valid.map(function (it) {
+                return fetchShowProgress(it.show.ids.trakt).then(function (progress) {
+                    return { it: it, progress: progress };
+                });
+            })).then(function (pairs) {
+                var rows = [];
+                pairs.forEach(function (p) {
+                    var show     = p.it.show;
+                    var progress = p.progress;
+                    var row = {
+                        id:               String(show.ids.tmdb),
+                        ids:              show.ids,
+                        title:            show.title || '',
+                        year:             show.year,
+                        status:           show.status || '',
+                        aired:            progress ? (progress.aired || 0) : 0,
+                        completed:        progress ? (progress.completed || 0) : 0,
+                        lastEpisode:      progress && progress.last_episode,
+                        lastAiredWatched: isLastAiredWatched(progress)
+                    };
+                    row.folder = classifyShow(row);
+                    log('классификация сериала', {
+                        title:              row.title,
+                        tmdb:               row.id,
+                        progress_aired:     row.aired,
+                        progress_completed: row.completed,
+                        show_status:        row.status,
+                        last_episode:       row.lastEpisode
+                            ? 'S' + row.lastEpisode.season + 'E' + row.lastEpisode.number
+                            : null,
+                        last_aired_watched: row.lastAiredWatched,
+                        classified_as:      row.folder || '— (completed == 0)'
+                    });
+                    if (row.folder) rows.push(row);
+                });
+                return rows;
+            });
         });
     }
 
@@ -616,6 +664,22 @@
                 look:      desired.look.length,
                 viewed:    desired.viewed.length,
                 continued: desired.continued.length
+            });
+            // Диагностика: выводим названия и trakt-id, чтобы можно было
+            // сверить с тем, что реально лежит в Trakt-аккаунте. Если тут
+            // появляются карточки, которых в Trakt-вебе нет, значит токен
+            // привязан к другому аккаунту или в Trakt есть рассинхрон
+            // между /sync/watched и UI-страницей History.
+            ['look', 'viewed', 'continued'].forEach(function (f) {
+                if (!desired[f].length) return;
+                log('папка ' + f + ': классифицировано', desired[f].map(function (s) {
+                    return {
+                        title: s.title,
+                        year:  s.year,
+                        tmdb:  s.id,
+                        trakt: s.ids && s.ids.trakt
+                    };
+                }));
             });
             return Promise.all([
                 syncStatusFolder('look',      desired.look),
@@ -828,6 +892,19 @@
         log('Готов', { version: VERSION, enabled: isEnabled() });
         initFavoriteListener();
         initActivityListener();
+
+        // Диагностика: какой Trakt-аккаунт стоит за этим токеном. Разовый
+        // запрос при старте, не влияет на горячий путь. Поможет отловить
+        // случай «токен от одного аккаунта, смотрим в Trakt-веб на другой».
+        traktFetch('/users/me').then(function (me) {
+            log('Trakt аккаунт', {
+                username: me && me.username,
+                name:     me && me.name,
+                ids:      me && me.ids
+            });
+        })['catch'](function (err) {
+            warn('/users/me запрос не прошёл', { status: err && err.status });
+        });
     }
 
     function init() {
