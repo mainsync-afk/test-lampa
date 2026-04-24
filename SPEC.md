@@ -88,7 +88,14 @@ completed > 0 && aired == completed && status ∈ {returning series, in producti
 
 **НЕ берём из него:**
 - `window.TraktTV.api.upnext()` — использует VIP-эндпоинт `/sync/progress/up_next_nitro`, отдаёт некорректные данные. Вместо этого сами вызываем публичные эндпоинты `/sync/watched/shows` и/или `/users/me/progress/watched/activity?hide_completed=true`.
-- В перспективе — и остальные API-методы (`watchlist`, `addToWatchlist` и т.п.) переводим на прямые `fetch` к `api.trakt.tv` с токеном из Lampa.Storage. Это убирает зависимость от интерпретации данных чужим плагином.
+- В перспективе — и остальные API-методы (`watchlist`, `addToWatchlist` и т.п.) делаем сами. Это убирает зависимость от интерпретации данных чужим плагином.
+
+**Базовый URL для наших запросов:** `https://apx.lme.isroot.in/trakt` — тот же прокси, который использует `trakt_by_lampame`. Прокси тупой: принимает Bearer-токен из `Lampa.Storage.get('trakt_token')`, на сервере подставляет `trakt-api-key` (client_id, под которым был выпущен токен), форвардит на `api.trakt.tv`. Уйти на прямой `api.trakt.tv` можно будет, только если зарегистрировать собственное приложение в Trakt и переиздать токен под его client_id — пока смысла не имеет. На интерпретацию ответов это не влияет: парсим Trakt-формат сами.
+
+Канонические заголовки (мы тоже их используем):
+- `Content-Type: application/json`
+- `trakt-api-version: 2`
+- `Authorization: Bearer <trakt_token>` (для авторизованных эндпоинтов)
 
 **Параллельная работа:** `trakt_by_lampame` продолжает подгружать данные для своих home-рядов («Trakt Up Next», «Trakt Watchlist» и т.п.) при открытии главного экрана Lampa. Наш плагин читает независимо при открытии Избранного. Пересечений в запросах на запись нет, rate limit Trakt (1000/5мин) запасает на порядок. Если home-ряды не нужны — отключаются в настройках главного экрана Lampa, OAuth при этом продолжает работать.
 
