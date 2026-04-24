@@ -8,10 +8,14 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.4.1';
+    var VERSION         = '0.4.2';
 
     var SYNC_TAG        = 'TraktFolderSync';
-    var COMPONENT       = 'trakt_folder_sync';
+    // Не создаём свой компонент — подмешиваем параметры в уже существующий
+    // раздел «Trakt» от плагина trakt_by_lampame / trakttv. В v0.4.0–0.4.1
+    // пробовали свой component: 'trakt_folder_sync' — Lampa регистрировала
+    // его без ошибок, но в UI панели он не появлялся. Возврат к паттерну v44.
+    var COMPONENT       = 'trakt';
     var STORAGE_ENABLED = 'trakt_folder_sync_enabled';
     var STORAGE_LOGGING = 'trakt_enable_logging';
 
@@ -22,16 +26,6 @@
 
     // Задержка между TMDB-обогащениями (чтобы не упираться в лимиты TMDB).
     var ADD_DELAY_MS = 150;
-
-    // Иконка раздела настроек. Lampa подкрашивает иконку через currentColor,
-    // но ждёт fill-based SVG: <path fill="currentColor" .../>, не stroke.
-    // Предыдущая версия с stroke-based путём не отрисовывалась и, похоже,
-    // ломала регистрацию всего компонента в панели настроек.
-    var SECTION_ICON =
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">' +
-        '<path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/>' +
-        '<path fill="currentColor" d="M7 8h10v2h-4v8h-2v-8H7z"/>' +
-        '</svg>';
 
     // -----------------------------------------------------------------------
     // Утилиты
@@ -294,47 +288,30 @@
     }
 
     // -----------------------------------------------------------------------
-    // Настройки — свой раздел, не подмешиваемся в «Trakt» от lampame.
+    // Настройки — подмешиваемся в существующий раздел «Trakt» от lampame.
+    // Свой раздел через addComponent в v0.4.0/0.4.1 визуально не появлялся,
+    // даже когда API-вызов проходил без ошибок. Паттерн v44 работает как
+    // ожидалось — ограничиваемся одним addParam.
     // -----------------------------------------------------------------------
 
     function addSettings() {
-        // Диагностика: смотрим, доходим ли вообще до регистрации.
-        warn('addSettings: старт', { version: VERSION, component: COMPONENT });
-
-        if (!Lampa.SettingsApi || typeof Lampa.SettingsApi.addComponent !== 'function') {
-            warn('addSettings: Lampa.SettingsApi.addComponent недоступен');
+        if (!Lampa.SettingsApi || typeof Lampa.SettingsApi.addParam !== 'function') {
+            warn('addSettings: Lampa.SettingsApi.addParam недоступен');
             return;
         }
 
-        try {
-            Lampa.SettingsApi.addComponent({
-                component: COMPONENT,
-                name:      'Trakt Folder Sync',
-                icon:      SECTION_ICON
-            });
-            warn('addSettings: addComponent ок');
-        } catch (e) {
-            warn('addSettings: addComponent ошибка', e);
-            return;
-        }
-
-        // Переключатель синхронизации — основной пункт.
-        // Версию плагина кладём в description, чтобы она была видна
-        // под заголовком переключателя без отдельного static-элемента
-        // (в прошлой версии static-элемент с onRender выбивался из
-        // общего стиля и, возможно, мешал регистрации компонента).
         try {
             Lampa.SettingsApi.addParam({
                 component: COMPONENT,
                 param: { name: STORAGE_ENABLED, type: 'trigger', 'default': true },
                 field: {
-                    name: 'Синхронизация папок с Trakt',
-                    description: 'v' + VERSION + ' — Закладки, Смотрю, Просмотрено, Продолжение следует'
+                    name: 'Синхронизация папок с Trakt (v' + VERSION + ')',
+                    description: 'Закладки, Смотрю, Просмотрено, Продолжение следует — отражают состояние Trakt'
                 }
             });
-            warn('addSettings: addParam toggle ок');
+            log('addSettings: ок');
         } catch (e) {
-            warn('addSettings: addParam toggle ошибка', e);
+            warn('addSettings: addParam ошибка', e);
         }
     }
 
