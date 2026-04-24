@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.4.0';
+    var VERSION         = '0.4.1';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var COMPONENT       = 'trakt_folder_sync';
@@ -23,11 +23,14 @@
     // Задержка между TMDB-обогащениями (чтобы не упираться в лимиты TMDB).
     var ADD_DELAY_MS = 150;
 
-    // Иконка раздела настроек — простой кружок с буквой T в стиле Trakt.
+    // Иконка раздела настроек. Lampa подкрашивает иконку через currentColor,
+    // но ждёт fill-based SVG: <path fill="currentColor" .../>, не stroke.
+    // Предыдущая версия с stroke-based путём не отрисовывалась и, похоже,
+    // ломала регистрацию всего компонента в панели настроек.
     var SECTION_ICON =
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none">' +
-        '<circle cx="24" cy="24" r="22" fill="none" stroke="currentColor" stroke-width="3"/>' +
-        '<path d="M14 14 L24 24 L34 14 M19 29 L29 19" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>' +
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">' +
+        '<path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/>' +
+        '<path fill="currentColor" d="M7 8h10v2h-4v8h-2v-8H7z"/>' +
         '</svg>';
 
     // -----------------------------------------------------------------------
@@ -295,35 +298,44 @@
     // -----------------------------------------------------------------------
 
     function addSettings() {
-        Lampa.SettingsApi.addComponent({
-            component: COMPONENT,
-            name:      'Trakt Folder Sync',
-            icon:      SECTION_ICON
-        });
+        // Диагностика: смотрим, доходим ли вообще до регистрации.
+        warn('addSettings: старт', { version: VERSION, component: COMPONENT });
 
-        // Заголовок с версией — первым пунктом.
-        Lampa.SettingsApi.addParam({
-            component: COMPONENT,
-            param: { name: 'trakt_folder_sync_header', type: 'static' },
-            field: { name: '' },
-            onRender: function (item) {
-                item.empty();
-                item.append(
-                    '<div style="padding:1em 1.5em;opacity:.7;font-size:1.1em;">' +
-                    'Trakt Folder Sync <b>v' + VERSION + '</b>' +
-                    '</div>'
-                );
-            }
-        });
+        if (!Lampa.SettingsApi || typeof Lampa.SettingsApi.addComponent !== 'function') {
+            warn('addSettings: Lampa.SettingsApi.addComponent недоступен');
+            return;
+        }
 
-        Lampa.SettingsApi.addParam({
-            component: COMPONENT,
-            param: { name: STORAGE_ENABLED, type: 'trigger', 'default': true },
-            field: {
-                name: 'Синхронизация папок с Trakt',
-                description: 'Закладки, Смотрю, Просмотрено, Продолжение следует — отражают состояние Trakt'
-            }
-        });
+        try {
+            Lampa.SettingsApi.addComponent({
+                component: COMPONENT,
+                name:      'Trakt Folder Sync',
+                icon:      SECTION_ICON
+            });
+            warn('addSettings: addComponent ок');
+        } catch (e) {
+            warn('addSettings: addComponent ошибка', e);
+            return;
+        }
+
+        // Переключатель синхронизации — основной пункт.
+        // Версию плагина кладём в description, чтобы она была видна
+        // под заголовком переключателя без отдельного static-элемента
+        // (в прошлой версии static-элемент с onRender выбивался из
+        // общего стиля и, возможно, мешал регистрации компонента).
+        try {
+            Lampa.SettingsApi.addParam({
+                component: COMPONENT,
+                param: { name: STORAGE_ENABLED, type: 'trigger', 'default': true },
+                field: {
+                    name: 'Синхронизация папок с Trakt',
+                    description: 'v' + VERSION + ' — Закладки, Смотрю, Просмотрено, Продолжение следует'
+                }
+            });
+            warn('addSettings: addParam toggle ок');
+        } catch (e) {
+            warn('addSettings: addParam toggle ошибка', e);
+        }
     }
 
     // -----------------------------------------------------------------------
