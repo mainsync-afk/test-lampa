@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.5.0';
+    var VERSION         = '0.5.1';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // Не создаём свой компонент — подмешиваем параметры в уже существующий
@@ -34,10 +34,16 @@
     // См. SPEC.md § «Задержки Trakt API и механизм Pending Ops».
     var PENDING_TTL_SEC = 15 * 60;
 
-    // Таймаут «страховки» для _ownOps: если событие от Favorite не пришло
-    // по какой-то причине, метка всё равно очистится и не будет мешать
-    // последующим реальным действиям пользователя.
-    var OWN_OPS_TIMEOUT_MS = 10000;
+    // Окно, в течение которого метка _ownOps защищает от парных событий
+    // Favorite.listener (Lampa иногда эмитит add/remove дважды за одну
+    // операцию — в этом окне оба события считаются «нашими»).
+    // 1.5 секунды — с запасом на задержку листенера.
+    var OWN_OPS_TTL_MS = 1500;
+
+    // Окно дедупликации исходящих POST-запросов в Trakt по id+action.
+    // Защищает от дубля, когда Lampa эмитит парные события от действия
+    // пользователя (оба прошли consumeOwn, оба улетели бы в Trakt).
+    var WRITE_DEDUP_WINDOW_MS = 1500;
 
     // -----------------------------------------------------------------------
     // Утилиты
@@ -141,26 +147,32 @@
     // на Favorite.listener — те же события слушает наш favorite-listener,
     // и без защиты каждая наша синхронизация порождала бы write-запрос в
     // Trakt, размножая действия пользователя.
+    //
+    // Lampa в некоторых случаях эмитит события парно (два события на одну
+    // операцию), поэтому метка работает как TTL-окно, а не как одноразовый
+    // consume: пока метка жива — ВСЕ события с этим id пропускаются.
 
-    var _ownOps = new Set();
+    var _ownOps = new Map(); // id (string) → expiresAtMs
 
     function markOwn(id) {
         if (!id) return;
-        id = String(id);
-        _ownOps.add(id);
-        // Если событие по какой-то причине не пришло — снимаем метку сами,
-        // чтобы реальное действие пользователя через 11 секунд отработало.
-        setTimeout(function () { _ownOps['delete'](id); }, OWN_OPS_TIMEOUT_MS);
+        // Ленивая GC протухших записей, чтобы Map не рос вечно.
+        var now = Date.now();
+        _ownOps.forEach(function (exp, k) { if (now > exp) _ownOps['delete'](k); });
+        _ownOps.set(String(id), now + OWN_OPS_TTL_MS);
     }
 
     function consumeOwn(id) {
         if (!id) return false;
         id = String(id);
-        if (_ownOps.has(id)) {
+        var exp = _ownOps.get(id);
+        if (!exp) return false;
+        if (Date.now() > exp) {
             _ownOps['delete'](id);
-            return true;
+            return false;
         }
-        return false;
+        // Метку НЕ удаляем — пусть накроет парное событие в TTL-окне.
+        return true;
     }
 
     // -----------------------------------------------------------------------
@@ -425,10 +437,30 @@
         return { body: body, type: isShow ? 'show' : 'movie', id: id };
     }
 
+    // Дедуп исходящих write-запросов. Lampa может эмитить add/remove парно;
+    // без этой защиты каждое действие пользователя улетало бы в Trakt дважды.
+    // Ключ — action+id (не action+id+type), потому что парное событие может
+    // прийти с вырожденной карточкой, у которой наш cardIsShow даёт movie
+    // вместо show — и дубль бы прошёл как «другой тип».
+    var _recentWrites = new Map(); // 'add:123' → timestampMs
+
     function pushWatchlist(action, card) {
         if (!hasToken()) return;
         var built = buildWatchlistBody(card);
         if (!built) { warn('pushWatchlist: нет tmdb id', card); return; }
+
+        var key  = action + ':' + built.id;
+        var now  = Date.now();
+        var last = _recentWrites.get(key);
+        if (last && (now - last) < WRITE_DEDUP_WINDOW_MS) {
+            log('pushWatchlist: дубль в окне дедупа, пропуск', { key: key });
+            return;
+        }
+        _recentWrites.set(key, now);
+        // Ленивая GC давних записей.
+        _recentWrites.forEach(function (ts, k) {
+            if ((now - ts) > WRITE_DEDUP_WINDOW_MS * 4) _recentWrites['delete'](k);
+        });
 
         var path = action === 'remove' ? '/sync/watchlist/remove' : '/sync/watchlist';
         traktFetch(path, { method: 'POST', body: built.body })
