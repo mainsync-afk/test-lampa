@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.8.1';
+    var VERSION         = '0.8.2';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
@@ -968,6 +968,28 @@
             });
     }
 
+    function postHistoryUnmarkFirst(id) {
+        // Зеркало postHistoryMarkFirst: снимает именно тот S01E01, который мы
+        // поставили в качестве подсказки Trakt'у при add в look. Реальную
+        // пользовательскую историю за пределами S01E01 не трогаем — если она
+        // есть, классификатор оставит сериал в look/viewed как положено.
+        var body = {
+            shows: [{
+                ids: { tmdb: Number(id) },
+                seasons: [{ number: 1, episodes: [{ number: 1 }] }]
+            }]
+        };
+        return traktFetch('/sync/history/remove', { method: 'POST', body: body })
+            .then(function (resp) {
+                log('history remove (look-start S01E01) ok', { id: id, resp: resp });
+                addPendingOp({ id: id, type: 'show', folder: 'look', action: 'remove' });
+            })['catch'](function (err) {
+                warn('history remove (look-start) failed', {
+                    id: id, status: err && err.status, response: err && err.response
+                });
+            });
+    }
+
     function postHistoryAllAired(action, card, id) {
         return resolveShowKeyForProgress(card).then(function (showKey) {
             if (!showKey) {
@@ -1043,21 +1065,21 @@
         }
 
         if (folder === 'look') {
-            if (action === 'remove') {
-                // remove из look — производное состояние, которое мы не можем
-                // «снять» одним действием (нужно было бы снимать историю всего
-                // что отсмотрено). На следующей синхронизации классификатор
-                // вернёт карточку туда, где ей место по данным Trakt.
-                log('remove из look — no-op (производная папка)', { id: id });
-                return;
-            }
             // look в Trakt-модели существует только для сериалов. Тип карточки
             // НЕ проверяем: Lampa в листенер часто отдаёт тощую карточку, где
             // ни method, ни card_type, ни number_of_seasons не выставлены
             // (см. лог 2026-04-25 — Breaking Bad tmdb=1396 пришёл без типизации
             // и был принят за фильм). Постим S01E01 безусловно — если тмдб id
             // принадлежит фильму, Trakt просто ничего не сделает с seasons.
-            postHistoryMarkFirst(id);
+            //
+            // add: помечаем S01E01 как просмотренный (completed>0, next_episode
+            // указывает на S01E02, классификатор выдаёт look).
+            // remove: зеркально снимаем S01E01. Если у пользователя реальная
+            // история за пределами S01E01 — классификатор оставит сериал
+            // там, где ему место (look/viewed/continued), и это корректно:
+            // наше действие обратимо только в части нашей же подсказки.
+            if (action === 'add')    postHistoryMarkFirst(id);
+            else                     postHistoryUnmarkFirst(id);
             return;
         }
 
