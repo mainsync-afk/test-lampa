@@ -8,9 +8,10 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.7.1';
+    var VERSION         = '0.8.0';
 
     var SYNC_TAG        = 'TraktFolderSync';
+    var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
     // Не создаём свой компонент — подмешиваем параметры в уже существующий
     // раздел «Trakt» от плагина trakt_by_lampame / trakttv. В v0.4.0–0.4.1
     // пробовали свой component: 'trakt_folder_sync' — Lampa регистрировала
@@ -459,9 +460,8 @@
     // Фильмы в viewed — /sync/watched/movies (любой plays > 0 = смотрели).
     // Сериалы идут в look/viewed/continued, фильмы — только в viewed.
     //
-    // Write-путь у статусных папок не реализован: отметка серий
-    // просмотренными делается сторонним плагином scrobbling'ом, мы лишь
-    // отражаем итоговую раскладку.
+    // Write-путь статусных папок реализован ниже (pushHistory): действия
+    // пользователя в Lampa транслируются в POST /sync/history[/remove].
 
     function classifyShow(row) {
         var completed = row.completed || 0;
@@ -560,6 +560,60 @@
         });
     }
 
+    // Накладываем pending ops на желаемое распределение по статусным папкам.
+    //
+    // Семантика:
+    // • pending add в папку X → карточка должна быть ТОЛЬКО в X (убираем
+    //   id из остальных статусных папок desired; если X не содержит id —
+    //   вставляем минимальный stub, чтобы sync не удалил локальную копию).
+    // • pending remove из любой статусной папки → убираем id из всех
+    //   статусных папок desired (карточка не должна нигде появиться).
+    //
+    // Причина: Trakt отдаёт устаревшее состояние 5–15 минут после записи,
+    // и без этого классификатор положил бы сериал обратно в ту папку, из
+    // которой пользователь только что увёл.
+    function applyStatusPendingOps(desired) {
+        var pending = loadPendingOps().filter(function (op) {
+            return STATUS_FOLDERS.indexOf(op.folder) >= 0;
+        });
+        if (!pending.length) return;
+
+        pending.forEach(function (op) {
+            var id = String(op.id);
+
+            if (op.action === 'add') {
+                STATUS_FOLDERS.forEach(function (f) {
+                    if (f === op.folder) return;
+                    desired[f] = desired[f].filter(function (c) {
+                        return String(c.id) !== id;
+                    });
+                });
+                var exists = desired[op.folder].some(function (c) {
+                    return String(c.id) === id;
+                });
+                if (!exists) {
+                    var isMovie = op.type === 'movie';
+                    desired[op.folder].push({
+                        id:        id,
+                        ids:       { tmdb: Number(id) },
+                        method:    isMovie ? 'movie' : 'tv',
+                        card_type: isMovie ? 'movie' : 'tv'
+                    });
+                }
+            }
+
+            if (op.action === 'remove') {
+                STATUS_FOLDERS.forEach(function (f) {
+                    desired[f] = desired[f].filter(function (c) {
+                        return String(c.id) !== id;
+                    });
+                });
+            }
+        });
+
+        log('status pending ops применены', { total: pending.length });
+    }
+
     function computeStatusFolders() {
         return Promise.all([fetchShowsClassification(), fetchWatchedMovies()])
             .then(function (results) {
@@ -589,6 +643,8 @@
                         card_type: 'movie'
                     });
                 });
+
+                applyStatusPendingOps(desired);
 
                 return desired;
             });
@@ -732,28 +788,33 @@
 
     // Дедуп исходящих write-запросов. Lampa может эмитить add/remove парно;
     // без этой защиты каждое действие пользователя улетало бы в Trakt дважды.
-    // Ключ — action+id (не action+id+type), потому что парное событие может
-    // прийти с вырожденной карточкой, у которой наш cardIsShow даёт movie
-    // вместо show — и дубль бы прошёл как «другой тип».
-    var _recentWrites = new Map(); // 'add:123' → timestampMs
+    // Ключ — folder+action+id. folder нужен, чтобы различать переход между
+    // папками (remove из look + add в viewed — это два разных события, оба
+    // должны пройти).
+    var _recentWrites = new Map(); // 'book/add:123' → timestampMs
 
-    function pushWatchlist(action, card) {
-        if (!hasToken()) return;
-        var built = buildWatchlistBody(card);
-        if (!built) { warn('pushWatchlist: нет tmdb id', card); return; }
-
-        var key  = action + ':' + built.id;
+    function checkWriteDedup(action, folder, id) {
+        var key  = folder + '/' + action + ':' + id;
         var now  = Date.now();
         var last = _recentWrites.get(key);
         if (last && (now - last) < WRITE_DEDUP_WINDOW_MS) {
-            log('pushWatchlist: дубль в окне дедупа, пропуск', { key: key });
-            return;
+            log('write: дубль в окне дедупа, пропуск', { key: key });
+            return true;
         }
         _recentWrites.set(key, now);
         // Ленивая GC давних записей.
         _recentWrites.forEach(function (ts, k) {
             if ((now - ts) > WRITE_DEDUP_WINDOW_MS * 4) _recentWrites['delete'](k);
         });
+        return false;
+    }
+
+    function pushWatchlist(action, card) {
+        if (!hasToken()) return;
+        var built = buildWatchlistBody(card);
+        if (!built) { warn('pushWatchlist: нет tmdb id', card); return; }
+
+        if (checkWriteDedup(action, 'book', built.id)) return;
 
         var path = action === 'remove' ? '/sync/watchlist/remove' : '/sync/watchlist';
         traktFetch(path, { method: 'POST', body: built.body })
@@ -794,6 +855,187 @@
             });
     }
 
+    // -----------------------------------------------------------------------
+    // Write-путь для статусных папок: /sync/history[/remove]
+    // -----------------------------------------------------------------------
+    //
+    // SPEC.md § «Ручные действия пользователя».
+    //
+    // Для фильма viewed — прямолинейно: POST с { movies: [...] }.
+    //
+    // Для сериала viewed — нам нужно отметить ВСЕ вышедшие эпизоды. Берём
+    // их из /shows/:id/progress/watched и складываем в body одним запросом
+    // (Trakt принимает массив сезонов с массивами эпизодов внутри одного
+    // /sync/history). Это одно обращение к серверу, а не N по эпизодам.
+    //
+    // Для look на сериале — «подсказка Trakt'у»: отмечаем просмотренной
+    // только S01E01, чтобы completed стал > 0 и next_episode указал на
+    // S01E02. Классификатор получит look. Остальные эпизоды не трогаем —
+    // они остаются в том состоянии, что были (например, если пользователь
+    // уже смотрел часть через scrobble, ничего не теряется).
+    //
+    // look на фильме и continued на чём угодно — действия, которые нельзя
+    // выразить через Trakt API. Игнорируем с логом; карточка либо откатится
+    // на следующей синхронизации (если это продукт перемещения), либо так
+    // и останется локально (что нежелательно, но безвредно).
+
+    // Если у карточки есть trakt id — используем его; иначе резолвим через
+    // /search/tmdb. Нужно для /shows/:id/progress/watched: этот эндпоинт
+    // принимает trakt id / trakt slug / imdb id, но НЕ tmdb id.
+    function resolveShowKeyForProgress(card) {
+        if (card && card.ids && card.ids.trakt)  return Promise.resolve(card.ids.trakt);
+        if (card && card.ids && card.ids.imdb)   return Promise.resolve(card.ids.imdb);
+        var id = tmdbId(card);
+        if (!id) return Promise.resolve(null);
+        return traktFetch('/search/tmdb/' + id + '?type=show')
+            .then(function (results) {
+                if (!Array.isArray(results) || !results.length) return null;
+                var hit = results.find(function (r) {
+                    return r && r.show && r.show.ids && r.show.ids.trakt;
+                });
+                return hit ? hit.show.ids.trakt : null;
+            })
+            ['catch'](function (err) {
+                warn('search tmdb failed', { tmdb: id, err: err && err.message });
+                return null;
+            });
+    }
+
+    function postHistoryMovie(action, id) {
+        var body = { movies: [{ ids: { tmdb: Number(id) } }] };
+        var path = action === 'remove' ? '/sync/history/remove' : '/sync/history';
+        return traktFetch(path, { method: 'POST', body: body })
+            .then(function (resp) {
+                log('history ' + action + ' (movie) ok', { id: id, resp: resp });
+                addPendingOp({ id: id, type: 'movie', folder: 'viewed', action: action });
+            })['catch'](function (err) {
+                warn('history ' + action + ' (movie) failed', {
+                    id: id, status: err && err.status, response: err && err.response
+                });
+            });
+    }
+
+    function postHistoryMarkFirst(id) {
+        // Одна POST /sync/history, где сериал задан через tmdb id + указан
+        // конкретный эпизод S01E01. Trakt примет без фетча progress'а.
+        var body = {
+            shows: [{
+                ids: { tmdb: Number(id) },
+                seasons: [{ number: 1, episodes: [{ number: 1 }] }]
+            }]
+        };
+        return traktFetch('/sync/history', { method: 'POST', body: body })
+            .then(function (resp) {
+                log('history add (look-start S01E01) ok', { id: id, resp: resp });
+                addPendingOp({ id: id, type: 'show', folder: 'look', action: 'add' });
+            })['catch'](function (err) {
+                warn('history add (look-start) failed', {
+                    id: id, status: err && err.status, response: err && err.response
+                });
+            });
+    }
+
+    function postHistoryAllAired(action, card, id) {
+        return resolveShowKeyForProgress(card).then(function (showKey) {
+            if (!showKey) {
+                warn('history ' + action + ' (show): не удалось резолвить trakt/imdb id', {
+                    tmdb: id
+                });
+                return;
+            }
+            return fetchShowProgress(showKey).then(function (progress) {
+                if (!progress || !Array.isArray(progress.seasons)) {
+                    warn('history ' + action + ' (show): нет progress.seasons', {
+                        tmdb: id, showKey: showKey
+                    });
+                    return;
+                }
+                var seasons = progress.seasons.map(function (s) {
+                    return {
+                        number: s.number,
+                        episodes: (s.episodes || []).map(function (e) {
+                            return { number: e.number };
+                        })
+                    };
+                }).filter(function (s) { return s.episodes.length > 0; });
+
+                if (!seasons.length) {
+                    warn('history ' + action + ' (show): ни одной вышедшей серии', {
+                        tmdb: id, showKey: showKey
+                    });
+                    return;
+                }
+
+                var body = {
+                    shows: [{
+                        ids: { tmdb: Number(id) },
+                        seasons: seasons
+                    }]
+                };
+                var epsCount = seasons.reduce(function (acc, s) {
+                    return acc + s.episodes.length;
+                }, 0);
+                var path = action === 'remove' ? '/sync/history/remove' : '/sync/history';
+                return traktFetch(path, { method: 'POST', body: body })
+                    .then(function (resp) {
+                        log('history ' + action + ' (show all-aired) ok', {
+                            tmdb: id, episodes: epsCount, resp: resp
+                        });
+                        addPendingOp({
+                            id: id, type: 'show', folder: 'viewed', action: action
+                        });
+                    })['catch'](function (err) {
+                        warn('history ' + action + ' (show all-aired) failed', {
+                            tmdb: id, status: err && err.status, response: err && err.response
+                        });
+                    });
+            });
+        });
+    }
+
+    function pushHistory(folder, action, card) {
+        if (!hasToken()) return;
+        var id = tmdbId(card);
+        if (!id) { warn('pushHistory: нет tmdb id', card); return; }
+        if (checkWriteDedup(action, folder, id)) return;
+
+        var isShow = cardIsShow(card);
+
+        if (folder === 'viewed') {
+            if (isShow) postHistoryAllAired(action, card, id);
+            else        postHistoryMovie(action, id);
+            return;
+        }
+
+        if (folder === 'look') {
+            if (!isShow) {
+                log('look для фильма — невозможно в модели Trakt, игнорируем',
+                    { id: id, action: action });
+                return;
+            }
+            if (action === 'add') {
+                postHistoryMarkFirst(id);
+                return;
+            }
+            // remove из look — производное состояние, которое мы не можем
+            // «снять» одним действием (нужно было бы снимать историю всего
+            // что отсмотрено). На следующей синхронизации классификатор
+            // вернёт карточку туда, где ей место по данным Trakt.
+            log('remove из look — no-op (производная папка)', { id: id });
+            return;
+        }
+
+        if (folder === 'continued') {
+            // continued — производная «догнан + выходит». Пользователь
+            // не может её проставить напрямую: нет действия, которое бы это
+            // сделало (mark as watched отправило бы в viewed или continued
+            // в зависимости от статуса сериала — это уже покрыто viewed-путём).
+            log('continued — производная папка, игнорируем действие',
+                { id: id, action: action });
+            return;
+        }
+    }
+
     function initFavoriteListener() {
         if (!Lampa.Favorite || !Lampa.Favorite.listener ||
             typeof Lampa.Favorite.listener.follow !== 'function') {
@@ -803,28 +1045,45 @@
 
         Lampa.Favorite.listener.follow('add', function (e) {
             if (!e || !e.where || !e.card) return;
-            if (e.where !== 'book') return;
             var id = tmdbId(e.card);
             if (consumeOwn(id)) {
-                log('Favorite.add — пропуск своей же операции', { id: id });
+                log('Favorite.add — пропуск своей же операции',
+                    { id: id, where: e.where });
                 return;
             }
             if (!isEnabled()) return;
-            log('Favorite.add пользователем → Trakt', { id: id });
-            pushWatchlist('add', e.card);
+            if (e.where === 'book') {
+                log('Favorite.add пользователем → Trakt', { id: id, where: e.where });
+                pushWatchlist('add', e.card);
+                return;
+            }
+            if (STATUS_FOLDERS.indexOf(e.where) >= 0) {
+                log('Favorite.add пользователем → Trakt',
+                    { id: id, where: e.where });
+                pushHistory(e.where, 'add', e.card);
+            }
         });
 
         Lampa.Favorite.listener.follow('remove', function (e) {
             if (!e || !e.where || !e.card) return;
-            if (e.where !== 'book') return;
             var id = tmdbId(e.card);
             if (consumeOwn(id)) {
-                log('Favorite.remove — пропуск своей же операции', { id: id });
+                log('Favorite.remove — пропуск своей же операции',
+                    { id: id, where: e.where });
                 return;
             }
             if (!isEnabled()) return;
-            log('Favorite.remove пользователем → Trakt', { id: id });
-            pushWatchlist('remove', e.card);
+            if (e.where === 'book') {
+                log('Favorite.remove пользователем → Trakt',
+                    { id: id, where: e.where });
+                pushWatchlist('remove', e.card);
+                return;
+            }
+            if (STATUS_FOLDERS.indexOf(e.where) >= 0) {
+                log('Favorite.remove пользователем → Trakt',
+                    { id: id, where: e.where });
+                pushHistory(e.where, 'remove', e.card);
+            }
         });
     }
 
