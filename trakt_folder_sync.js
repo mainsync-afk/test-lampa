@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.8.2';
+    var VERSION         = '0.8.3';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
@@ -16,10 +16,11 @@
     // раздел «Trakt» от плагина trakt_by_lampame / trakttv. В v0.4.0–0.4.1
     // пробовали свой component: 'trakt_folder_sync' — Lampa регистрировала
     // его без ошибок, но в UI панели он не появлялся. Возврат к паттерну v44.
-    var COMPONENT       = 'trakt';
-    var STORAGE_ENABLED = 'trakt_folder_sync_enabled';
-    var STORAGE_LOGGING = 'trakt_enable_logging';
-    var STORAGE_PENDING = 'trakt_folder_sync_pending';
+    var COMPONENT           = 'trakt';
+    var STORAGE_ENABLED     = 'trakt_folder_sync_enabled';
+    var STORAGE_LOGGING     = 'trakt_enable_logging';
+    var STORAGE_PENDING     = 'trakt_folder_sync_pending';
+    var STORAGE_PENDING_TTL = 'trakt_folder_sync_pending_ttl';
 
     // Базовый URL — тот же прокси, что использует trakt_by_lampame. Прокси
     // подставляет trakt-api-key на сервере, поэтому прямой api.trakt.tv без
@@ -33,7 +34,22 @@
     // Trakt API отдаёт устаревшие данные 5–15 минут после записи — в это
     // время действие пользователя не должно откатываться синхронизацией.
     // См. SPEC.md § «Задержки Trakt API и механизм Pending Ops».
-    var PENDING_TTL_SEC = 15 * 60;
+    //
+    // Значение по умолчанию — 15 минут (с запасом). С 0.8.3 значение можно
+    // менять в настройках (раздел «Trakt» → «Окно Pending Ops»): 15 мин /
+    // 5 мин / 1 мин / 10 сек / Выключено. Полезно для отладки, когда
+    // Trakt API отвечает быстро и ждать буфер незачем. Значение 0 полностью
+    // отключает буфер: ничего не сохраняется и ничего не накладывается на
+    // diff — синхронизация работает «как есть».
+    var PENDING_TTL_DEFAULT_SEC = 15 * 60;
+
+    function getPendingTtlSec() {
+        var raw = Lampa.Storage.field(STORAGE_PENDING_TTL);
+        if (raw == null || raw === '') return PENDING_TTL_DEFAULT_SEC;
+        var n = parseInt(raw, 10);
+        if (isNaN(n) || n < 0) return PENDING_TTL_DEFAULT_SEC;
+        return n;
+    }
 
     // Окно, в течение которого метка _ownOps защищает от парных событий
     // Favorite.listener (Lampa иногда эмитит add/remove дважды за одну
@@ -105,9 +121,17 @@
     // После каждой успешной записи в Trakt кладём сюда запись
     // { id, type, folder, action, ts }. На syncBook-е накладываем эти записи
     // поверх diff'а: pending add → не удалять, pending remove → не добавлять.
-    // По истечении PENDING_TTL_SEC запись протухает сама.
+    // По истечении окна (см. getPendingTtlSec) запись протухает сама.
 
     function loadPendingOps() {
+        var ttl = getPendingTtlSec();
+        // ttl=0 → буфер выключен пользователем. Чистим хранилище, чтобы
+        // протухшие записи из «вчерашнего» режима не накладывались.
+        if (ttl === 0) {
+            try { Lampa.Storage.set(STORAGE_PENDING, []); } catch (e) {}
+            return [];
+        }
+
         var raw;
         try { raw = Lampa.Storage.get(STORAGE_PENDING, '[]'); }
         catch (e) { return []; }
@@ -116,7 +140,7 @@
         catch (e) { return []; }
         if (!Array.isArray(arr)) return [];
 
-        var cutoff = Math.floor(Date.now() / 1000) - PENDING_TTL_SEC;
+        var cutoff = Math.floor(Date.now() / 1000) - ttl;
         var fresh  = arr.filter(function (op) {
             return op && op.id && op.action && op.ts && op.ts >= cutoff;
         });
@@ -129,6 +153,10 @@
 
     function addPendingOp(op) {
         if (!op || !op.id || !op.folder || !op.action) return;
+        // Буфер выключен — ничего не пишем. Действие пользователя уже улетело
+        // в Trakt (write-путь отработал), pending-ops просто не страхует от
+        // обратки на ближайшей синхронизации.
+        if (getPendingTtlSec() === 0) return;
         var ops = loadPendingOps();
         // Дубликаты (id+folder+action) заменяем свежим ts.
         ops = ops.filter(function (x) {
@@ -1184,9 +1212,36 @@
                     description: 'Закладки, Смотрю, Просмотрено, Продолжение следует — отражают состояние Trakt'
                 }
             });
+        } catch (e) {
+            warn('addSettings: addParam (enabled) ошибка', e);
+        }
+
+        // Окно Pending Ops. Значения — строки секунд (Lampa Storage.field
+        // возвращает их как есть). Дефолт 900 = 15 мин — соответствует
+        // PENDING_TTL_DEFAULT_SEC. Значение '0' = буфер выключен.
+        try {
+            Lampa.SettingsApi.addParam({
+                component: COMPONENT,
+                param: {
+                    name: STORAGE_PENDING_TTL,
+                    type: 'select',
+                    values: {
+                        '900': '15 минут (по умолчанию)',
+                        '300': '5 минут',
+                        '60':  '1 минута',
+                        '10':  '10 секунд',
+                        '0':   'Выключено'
+                    },
+                    'default': '900'
+                },
+                field: {
+                    name: 'Окно Pending Ops',
+                    description: 'Сколько секунд защищать только что изменённые карточки от отката синхронизацией. Меньше — быстрее тестировать. «Выключено» полностью отключает буфер.'
+                }
+            });
             log('addSettings: ок');
         } catch (e) {
-            warn('addSettings: addParam ошибка', e);
+            warn('addSettings: addParam (pending_ttl) ошибка', e);
         }
     }
 
