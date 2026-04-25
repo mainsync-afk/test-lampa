@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.8.4';
+    var VERSION         = '0.8.5';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
@@ -348,59 +348,97 @@
 
     var _syncingBook = false;
 
-    // Удаляет из Trakt watchlist «двойников» — пары, где один и тот же
-    // tmdb id присутствует и как movie, и как show. Это след бага 0.5.x–0.8.3:
-    // мы слали /sync/watchlist с id одновременно в movies и shows, рассчитывая
-    // что Trakt разрешит ровно одну сущность, — но TMDB id пересекаются между
-    // movies и shows (это РАЗНЫЕ namespace, но один и тот же номер часто
-    // занят и фильмом, и сериалом), и Trakt добавлял обе.
+    // Приводит тип записи в Trakt watchlist в соответствие с local Lampa book.
     //
-    // Что удаляем: тип, которого нет в local Lampa book для этого id. Если
-    // в Lampa книге нет карточки с этим id вообще — не трогаем (мало ли,
-    // пользователь сам в Trakt-вебе добавил оба).
-    function cleanupWatchlistDuplicates(rawMovies, rawShows) {
-        var movieIds = new Set();
-        var showIds  = new Set();
+    // Контекст и история:
+    //
+    // - До 0.8.3 add в /sync/watchlist слался одновременно в movies и shows.
+    //   Предполагалось, что лишний namespace уйдёт в not_found (TMDB id
+    //   namespaced per type). Это неверно: один и тот же tmdb id очень часто
+    //   занят и фильмом, и сериалом — это разные сущности с одним числом.
+    //   Trakt находил обе, наш собственный dedup по tmdb id маскировал пару
+    //   в diff'е (видим 1, в Trakt 2), и мусор оставался в watchlist навсегда.
+    //
+    // - В 0.8.4 добавили cleanup по парам (movie+show с одним id), но
+    //   определяли local-тип через эвристику cardIsShow. Для «тощих» local
+    //   карточек (без method/card_type/media_type/number_of_seasons) это
+    //   давало ложный movie — и cleanup удалял НЕ ТОТ тип, оставляя в Trakt
+    //   мусорный movie вместо нужного show. Лог 0.8.4: «removeType: 'show',
+    //   keepType: 'movie'» при том, что в Lampa у пользователя сериал.
+    //
+    // - 0.8.5: тип local карточки определяется через resolveCardType — он
+    //   сначала смотрит на поля, для тощих случаев идёт в /search/tmdb/:id.
+    //   И теперь это уже не «cleanup пары», а «привести тип к local»: если
+    //   в watchlist лежит неверный тип, удаляем его И добавляем правильный
+    //   (это лечит мусор, оставшийся от ошибочного cleanup'а 0.8.4).
+    function reconcileWatchlistType(rawMovies, rawShows) {
+        var byId = {}; // id → { movie?: true, show?: true }
         rawMovies.forEach(function (it) {
             var id = it && it.movie && it.movie.ids && it.movie.ids.tmdb;
-            if (id != null) movieIds.add(String(id));
+            if (id != null) {
+                id = String(id);
+                if (!byId[id]) byId[id] = {};
+                byId[id].movie = true;
+            }
         });
         rawShows.forEach(function (it) {
             var id = it && it.show && it.show.ids && it.show.ids.tmdb;
-            if (id != null) showIds.add(String(id));
+            if (id != null) {
+                id = String(id);
+                if (!byId[id]) byId[id] = {};
+                byId[id].show = true;
+            }
         });
-        var dups = [];
-        movieIds.forEach(function (id) { if (showIds.has(id)) dups.push(id); });
-        if (!dups.length) return;
 
         var local = Lampa.Favorite.get({ type: 'book' }) || [];
-        var localTypeById = {};
-        local.forEach(function (c) {
-            var lid = tmdbId(c);
-            if (!lid) return;
-            localTypeById[lid] = cardIsShow(c) ? 'show' : 'movie';
-        });
+        local.forEach(function (card) {
+            var id = tmdbId(card);
+            if (!id) return;
+            var slot = byId[id];
+            if (!slot) return; // карточки нет в watchlist — нечего реконсилить
 
-        dups.forEach(function (id) {
-            var localType = localTypeById[id];
-            if (!localType) {
-                warn('watchlist cleanup: пара movie+show, в Lampa нет — пропуск', { id: id });
-                return;
-            }
-            var unwanted = (localType === 'show') ? 'movie' : 'show';
-            var body = (unwanted === 'movie')
-                ? { movies: [{ ids: { tmdb: Number(id) } }] }
-                : { shows:  [{ ids: { tmdb: Number(id) } }] };
-            log('watchlist cleanup: удаляем дубль', { id: id, removeType: unwanted, keepType: localType });
-            traktFetch('/sync/watchlist/remove', { method: 'POST', body: body })
-                .then(function (resp) {
-                    log('watchlist cleanup ok', { id: id, removeType: unwanted, resp: resp });
-                })['catch'](function (err) {
-                    warn('watchlist cleanup failed', {
-                        id: id, removeType: unwanted,
-                        status: err && err.status, response: err && err.response
-                    });
+            resolveCardType(card).then(function (localType) {
+                if (localType !== 'show' && localType !== 'movie') {
+                    warn('reconcile: тип local-карточки не определён, пропуск', { id: id });
+                    return;
+                }
+                var unwantedType = (localType === 'show') ? 'movie' : 'show';
+                if (!slot[unwantedType]) return; // в watchlist только нужный тип — ок
+                var hadWanted = !!slot[localType];
+
+                var removeBody = (unwantedType === 'movie')
+                    ? { movies: [{ ids: { tmdb: Number(id) } }] }
+                    : { shows:  [{ ids: { tmdb: Number(id) } }] };
+                log('reconcile: удаляем неверный тип', {
+                    id: id, removeType: unwantedType, keepType: localType, hadPair: hadWanted
                 });
+                traktFetch('/sync/watchlist/remove', { method: 'POST', body: removeBody })
+                    .then(function (resp) {
+                        log('reconcile: remove ok', { id: id, removeType: unwantedType, resp: resp });
+                        if (hadWanted) return; // правильный тип уже был — done
+                        // Правильный тип отсутствовал (наследие 0.8.4 cleanup'а).
+                        // Доливаем правильный тип, чтобы local и watchlist сошлись.
+                        var addBody = (localType === 'show')
+                            ? { shows:  [{ ids: { tmdb: Number(id) } }] }
+                            : { movies: [{ ids: { tmdb: Number(id) } }] };
+                        return traktFetch('/sync/watchlist', { method: 'POST', body: addBody })
+                            .then(function (resp2) {
+                                log('reconcile: add ok', {
+                                    id: id, addType: localType, resp: resp2
+                                });
+                            })['catch'](function (err) {
+                                warn('reconcile: add failed', {
+                                    id: id, addType: localType,
+                                    status: err && err.status, response: err && err.response
+                                });
+                            });
+                    })['catch'](function (err) {
+                        warn('reconcile: remove failed', {
+                            id: id, removeType: unwantedType,
+                            status: err && err.status, response: err && err.response
+                        });
+                    });
+            });
         });
     }
 
@@ -420,14 +458,15 @@
             var rawShows  = Array.isArray(results[1]) ? results[1] : [];
             var rawItems  = rawMovies.concat(rawShows);
 
-            // Чистим наследованные дубли «movie+show с одним tmdb id» (баг
-            // 0.5.x–0.8.3, см. buildWatchlistBody): такие пары появлялись,
-            // когда мы слали add сразу в обе корзины Trakt, и Trakt находил
-            // обе сущности (TMDB id у фильма и сериала независимы, но часто
-            // пересекаются по числу). Огонь и забыли — наш собственный dedup
-            // по tmdb id маскировал пару в diff'е, и мусор оставался в Trakt
-            // навсегда. Вычищаем тип, которого нет в local Lampa book.
-            cleanupWatchlistDuplicates(rawMovies, rawShows);
+            // Приводим тип в Trakt watchlist к local Lampa book для каждого
+            // id, который есть и там, и там. Лечит:
+            //   • наследованные пары movie+show с одним tmdb id (баг 0.5.x–0.8.3,
+            //     см. buildWatchlistBody — слали в обе корзины);
+            //   • неправильно очищенные пары (баг 0.8.4 — cleanup определял
+            //     local-тип через cardIsShow, на «тощих» карточках это давало
+            //     ложный movie, и удалялся НЕ ТОТ тип).
+            // Подробности — в reconcileWatchlistType.
+            reconcileWatchlistType(rawMovies, rawShows);
 
             // Строим желаемое множество — тощие карточки с TMDB id.
             var desired = [];
