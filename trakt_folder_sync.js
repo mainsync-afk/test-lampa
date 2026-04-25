@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.9.0';
+    var VERSION         = '0.9.1-rc1';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
@@ -1549,6 +1549,18 @@
                 profile:  0,
                 received: true   // флаг для чужого плагина: не scrobble
             });
+            // rc1: post-write verify — Timeline.update должен был положить
+            // entry в file_view storage. Если не положил — что-то у Lampa
+            // изменилось в API.
+            var fv = Lampa.Storage.get(fileViewKey(), {}) || {};
+            log('markEpisode write', {
+                season: season, episode: episode, name: originalName, hash: h,
+                postWrite: fv[h] || null
+            });
+            // Помечаем как "только что мы записали" — наш же listener
+            // не должен отстреливать /sync/history/remove если этот hash
+            // потом приедет с percent=0 (например при перерисовке UI).
+            _pendingLampaMark[h] = Date.now();
             return true;
         } catch (e) {
             warn('markEpisodeInLampa failed', e);
@@ -1599,6 +1611,7 @@
     function collectShowsFromFavorites() {
         var fav = Lampa.Storage.get('favorite', {}) || {};
         var pool = {};
+        var rejectedNoName = 0, rejectedNotShow = 0;
         ['book', 'look', 'viewed', 'continued', 'card'].forEach(function (folder) {
             var arr = fav[folder];
             if (!Array.isArray(arr)) return;
@@ -1606,28 +1619,46 @@
                 if (!c) return;
                 var tmdb = c.id || (c.ids && c.ids.tmdb);
                 if (!tmdb) return;
-                var name = c.original_name || c.name;
-                if (!name) return;
-                // Эвристика "это сериал". method='tv' / number_of_seasons /
-                // origin_country (для shows ≠ movies). На тощих карточках
-                // полей нет — пропускаем; reconcile подцепит позже когда
-                // карточка обогатится.
+                // Hash в Lampa считается по original_name || original_title.
+                // Если ни того, ни другого нет — карточка тощая, hash посчитать
+                // не сможем, пропускаем (rc1: логируем для диагностики).
+                var name = c.original_name || c.original_title;
+                if (!name) {
+                    rejectedNoName++;
+                    return;
+                }
+                // Эвристика "это сериал". У фильмов в Lampa обычно есть
+                // original_title; у сериалов — original_name. method='tv' /
+                // number_of_seasons — дополнительные сигналы.
                 var looksShow = c.method === 'tv' ||
                                 !!c.number_of_seasons ||
-                                !!c.original_name; // у фильмов original_title
-                if (!looksShow) return;
+                                !!c.original_name;
+                if (!looksShow) {
+                    rejectedNotShow++;
+                    return;
+                }
                 if (!pool[String(tmdb)]) pool[String(tmdb)] = c;
             });
+        });
+        log('syncEpisodes: collectShowsFromFavorites', {
+            shows: Object.keys(pool).length,
+            rejectedNoName: rejectedNoName,
+            rejectedNotShow: rejectedNotShow
         });
         return pool;
     }
 
     function syncEpisodesForShow(card, progress) {
-        var name = card.original_name || card.name;
+        // ВАЖНО: используем ту же формулу, что Lampa.Timeline.watchedEpisode,
+        // иначе hash не совпадёт и наш mark уйдёт «в никуда».
+        // Lampa: card.original_name || card.original_title.
+        var name = card.original_name || card.original_title;
         var tmdb = card.id || (card.ids && card.ids.tmdb);
         if (!name) return { added: 0, removed: 0, skipped: true };
         var seasons = (progress && progress.seasons) || [];
         var added = 0, removed = 0, pendingSkipped = 0;
+        var fvBefore = Lampa.Storage.get(fileViewKey(), {}) || {};
+        var sampleHashes = [];
         seasons.forEach(function (s) {
             if (!s || s.number === 0) return;       // specials skip
             var snum = s.number;
@@ -1635,11 +1666,18 @@
                 if (!e || e.number == null) return;
                 var enum_ = e.number;
                 var traktWatched = !!e.completed;
+                var h = episodeHash(snum, enum_, name);
                 var lampaWatched = isWatchedInLampa(snum, enum_, name);
+                if (sampleHashes.length < 3) {
+                    sampleHashes.push({
+                        season: snum, episode: enum_, hash: h,
+                        traktWatched: traktWatched, lampaWatched: lampaWatched,
+                        lampaEntry: h ? fvBefore[h] : null
+                    });
+                }
                 if (traktWatched && !lampaWatched) {
                     if (markEpisodeInLampa(snum, enum_, name)) added++;
                 } else if (!traktWatched && lampaWatched) {
-                    var h = episodeHash(snum, enum_, name);
                     if (h && isPendingLampaMark(h)) {
                         pendingSkipped++;
                         return;
@@ -1648,11 +1686,16 @@
                 }
                 // Заодно поддерживаем реверс-индекс — он нужен для
                 // обработки unmark в Lampa (handleLampaUnmark матчит hash).
-                var idxH = episodeHash(snum, enum_, name);
-                if (idxH) _episodeHashIndex[idxH] = {
+                if (h) _episodeHashIndex[h] = {
                     tmdb: tmdb, season: snum, episode: enum_, name: name
                 };
             });
+        });
+        log('syncEpisodes: show=' + name, {
+            tmdb: tmdb, name: name,
+            seasons: seasons.length,
+            added: added, removed: removed, pendingSkipped: pendingSkipped,
+            sampleHashes: sampleHashes
         });
         return { added: added, removed: removed, pendingSkipped: pendingSkipped };
     }
@@ -1713,19 +1756,39 @@
         }
         Lampa.Timeline.listener.follow('update', function (e) {
             if (!isEnabled()) return;
+            // rc1: ПЕРВЫМ делом логируем всё что прилетело — до любых
+            // фильтров. Нужно понять: что приходит при тапе по серии в
+            // списке (percent=0 от user-снятия? новое значение?
+            // received:true потому что мы сами записали?).
+            var hash    = e && e.data && e.data.hash;
+            var road    = e && e.data && e.data.road;
+            var percent = road ? Number(road.percent || 0) : null;
+            log('Timeline.update event', {
+                received: !!(e && e.received),
+                hash: hash, percent: percent, road: road,
+                indexed: hash ? !!_episodeHashIndex[hash] : false,
+                pending: hash ? !!_pendingLampaMark[hash] : false
+            });
+
             if (!e || !e.data) return;
             // Наш собственный send (received:true) не трогаем — иначе
             // зацикливание на Trakt remove после нашего же unmark в Lampa.
             if (e.received) return;
-            var hash    = e.data.hash;
-            var road    = e.data.road || {};
-            var percent = Number(road.percent || 0);
             if (!hash) return;
+            if (percent === null) return;
 
             if (percent >= LAMPA_WATCHED_THRESHOLD) {
                 _pendingLampaMark[hash] = Date.now();
             } else if (percent === 0) {
-                // Снятие галочки в Lampa. Шлём в Trakt /sync/history/remove.
+                // Снятие галочки в Lampa: тап по серии в списке,
+                // если она была отмечена. Шлём в Trakt /sync/history/remove.
+                // _pendingLampaMark защищает от ложного снятия — если мы
+                // только что сами записали этот hash, percent=0 не наш
+                // user-action (а возможно артефакт перерисовки).
+                if (_pendingLampaMark[hash]) {
+                    log('Timeline percent=0 на pending hash — игнор', { hash: hash });
+                    return;
+                }
                 handleLampaUnmark(hash);
             }
             // Иные значения (1..89) — playback-progress, нас не интересует
