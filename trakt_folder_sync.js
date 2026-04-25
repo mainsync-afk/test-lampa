@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.9.1-rc1';
+    var VERSION         = '0.9.1-rc2';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
@@ -1505,7 +1505,19 @@
     var EPISODE_SYNC_PENDING_TTL_MS = 60 * 1000;
     var _syncingEpisodes = false;
     var _episodeHashIndex = {};   // hash → { tmdb, season, episode, name }
-    var _pendingLampaMark = {};   // hash → ts (defense от unmark race)
+    // Две независимые защиты — путать нельзя (rc1 → rc2 фикс):
+    //   _selfWriteMark[h]    — мы (плагин) только что записали Timeline.update
+    //                          для этого hash. Listener percent=0 после такой
+    //                          записи трактуем как echo, не как user-unmark.
+    //   _pendingLampaMark[h] — user только что отметил серию в Lampa
+    //                          (listener percent≥threshold). Используется
+    //                          ТОЛЬКО в reconcile (syncEpisodesForShow), чтобы
+    //                          не снять отметку до того, как chuck-плагин
+    //                          допишет её в Trakt. В самом listener percent=0
+    //                          этот флаг НЕ читаем, иначе блокирует ровно тот
+    //                          сценарий, который должны поймать (rc1 bug).
+    var _selfWriteMark    = {};
+    var _pendingLampaMark = {};
 
     // Hash как считает Lampa.Timeline.watchedEpisode:
     //   Utils.hash([season, season>10?':':'', episode, original_name].join(''))
@@ -1557,10 +1569,11 @@
                 season: season, episode: episode, name: originalName, hash: h,
                 postWrite: fv[h] || null
             });
-            // Помечаем как "только что мы записали" — наш же listener
-            // не должен отстреливать /sync/history/remove если этот hash
-            // потом приедет с percent=0 (например при перерисовке UI).
-            _pendingLampaMark[h] = Date.now();
+            // rc2: помечаем как self-write — наш listener при percent=0
+            // должен это игнорировать (echo от перерисовки), не уходить
+            // в /sync/history/remove. user-mark в Lampa в эту же ячейку
+            // не пишет (отдельный _pendingLampaMark в listener).
+            _selfWriteMark[h] = Date.now();
             return true;
         } catch (e) {
             warn('markEpisodeInLampa failed', e);
@@ -1599,6 +1612,15 @@
         if (!ts) return false;
         if (Date.now() - ts > EPISODE_SYNC_PENDING_TTL_MS) {
             delete _pendingLampaMark[hash];
+            return false;
+        }
+        return true;
+    }
+    function isSelfWriteMark(hash) {
+        var ts = _selfWriteMark[hash];
+        if (!ts) return false;
+        if (Date.now() - ts > EPISODE_SYNC_PENDING_TTL_MS) {
+            delete _selfWriteMark[hash];
             return false;
         }
         return true;
@@ -1719,28 +1741,67 @@
         }
         log('syncEpisodes: сериалов к проверке', ids.length);
 
-        var totalAdded = 0, totalRemoved = 0;
-        var promises = ids.map(function (id) {
-            return traktFetch('/shows/' + id + '/progress/watched')
-                .then(function (progress) {
-                    if (!progress) return;
-                    var r = syncEpisodesForShow(pool[id], progress);
-                    if (r && (r.added || r.removed)) {
-                        log('syncEpisodes: сериал ' + (pool[id].name || id), {
-                            tmdb: id, added: r.added, removed: r.removed
-                        });
-                        totalAdded   += r.added;
-                        totalRemoved += r.removed;
+        // rc2 КРИТИЧНЫЙ ФИКС: Trakt API /shows/:id/progress/watched
+        // ожидает Trakt id (или slug или imdb), а не TMDB id. Если
+        // передать TMDB id, Trakt трактует его как Trakt id и отдаёт
+        // progress совершенно другого сериала (тот, у кого Trakt id =
+        // нашему TMDB id) — отсюда rc1 added=0 для всех. Резолвим
+        // TMDB→Trakt через /sync/watched/shows (один запрос, отдаёт
+        // mapping для всех сериалов с любым watched в Trakt). Шоу
+        // которых там нет — пропускаем (в Trakt 0 просмотрено,
+        // синхронизировать нечего, при первой отметке через chuck-
+        // плагин они появятся в /sync/watched и попадут в следующий
+        // reconcile).
+        traktFetch('/sync/watched/shows').then(function (items) {
+            var tmdbToTraktId = {};
+            if (Array.isArray(items)) {
+                items.forEach(function (it) {
+                    var s = it && it.show && it.show.ids;
+                    if (s && s.tmdb && s.trakt) {
+                        tmdbToTraktId[String(s.tmdb)] = s.trakt;
                     }
-                })['catch'](function (err) {
-                    warn('syncEpisodes: progress failed', {
-                        tmdb: id, status: err && err.status
-                    });
                 });
-        });
-        Promise.all(promises).then(function () {
+            }
+            var resolved = [];
+            var skipped = [];
+            ids.forEach(function (id) {
+                if (tmdbToTraktId[id]) resolved.push(id);
+                else skipped.push(id);
+            });
+            log('syncEpisodes: TMDB→Trakt id', {
+                resolved: resolved.length,
+                skippedNoTraktWatch: skipped.length,
+                skippedIds: skipped
+            });
+
+            var totalAdded = 0, totalRemoved = 0;
+            var promises = resolved.map(function (id) {
+                var traktId = tmdbToTraktId[id];
+                return traktFetch('/shows/' + traktId + '/progress/watched')
+                    .then(function (progress) {
+                        if (!progress) return;
+                        var r = syncEpisodesForShow(pool[id], progress);
+                        if (r && (r.added || r.removed)) {
+                            log('syncEpisodes: сериал ' + (pool[id].name || id), {
+                                tmdb: id, traktId: traktId,
+                                added: r.added, removed: r.removed
+                            });
+                            totalAdded   += r.added;
+                            totalRemoved += r.removed;
+                        }
+                    })['catch'](function (err) {
+                        warn('syncEpisodes: progress failed', {
+                            tmdb: id, traktId: traktId, status: err && err.status
+                        });
+                    });
+            });
+            Promise.all(promises).then(function () {
+                _syncingEpisodes = false;
+                log('syncEpisodes: готово', { added: totalAdded, removed: totalRemoved });
+            });
+        })['catch'](function (err) {
             _syncingEpisodes = false;
-            log('syncEpisodes: готово', { added: totalAdded, removed: totalRemoved });
+            warn('syncEpisodes: /sync/watched/shows failed', { status: err && err.status });
         });
     }
 
@@ -1778,15 +1839,17 @@
             if (percent === null) return;
 
             if (percent >= LAMPA_WATCHED_THRESHOLD) {
+                // user отметил серию в Lampa. Защита для reconcile —
+                // chuck-плагин ещё не успел уехать в Trakt, наш reconcile
+                // не должен снять отметку обратно. В самом listener этот
+                // флаг НЕ читаем (rc1 bug — блокировал legitimate unmark).
                 _pendingLampaMark[hash] = Date.now();
             } else if (percent === 0) {
-                // Снятие галочки в Lampa: тап по серии в списке,
-                // если она была отмечена. Шлём в Trakt /sync/history/remove.
-                // _pendingLampaMark защищает от ложного снятия — если мы
-                // только что сами записали этот hash, percent=0 не наш
-                // user-action (а возможно артефакт перерисовки).
-                if (_pendingLampaMark[hash]) {
-                    log('Timeline percent=0 на pending hash — игнор', { hash: hash });
+                // Снятие отметки в Lampa: тап по серии в списке.
+                // Игнорируем только если это echo от нашего же write
+                // (markEpisodeInLampa поставил _selfWriteMark).
+                if (isSelfWriteMark(hash)) {
+                    log('Timeline percent=0 — echo от self-write, игнор', { hash: hash });
                     return;
                 }
                 handleLampaUnmark(hash);
