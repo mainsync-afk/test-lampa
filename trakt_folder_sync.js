@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.8.7';
+    var VERSION         = '0.9.0-rc1';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
@@ -910,6 +910,137 @@
         } catch (e) { warn('dumpFavoriteInternals failed', e); }
     }
 
+    // -------------------------------------------------------------------
+    // v0.9.0-rc1 диагностика: где Lampa хранит per-episode "просмотрено"?
+    // -------------------------------------------------------------------
+    // Lampa.Favorite — карточно-уровневая (book/look/viewed/...), эпизодов
+    // там нет. Чужой плагин trakt_by_lampame ловит только playback-события
+    // (Lampa.Timeline.listener('update') + Lampa.Player.listener('ended'))
+    // и шлёт POST /sync/history при доигрывании серии. Ручная галочка
+    // «просмотрено» на отдельной серии и снятие галочки в нём не
+    // обрабатываются.
+    //
+    // Чтобы реализовать v0.9.0 (двусторонний sync per-episode), нам надо
+    // понять, какой Lampa.Storage-ключ хранит факт «эта серия отмечена»
+    // и какова форма записи. Этот дамп — разовый, не делает запросов и
+    // ничего не пишет. Активация двумя путями:
+    //   1) Lampa.Storage.set('trakt_dump_episodes_once', true)  — затем
+    //      открыть Избранное; флаг сбрасывается после дампа.
+    //   2) Lampa.Storage.set('trakt_dump_episodes', true)       — дампит
+    //      каждый раз (для отладки в нескольких сериалах подряд), пока
+    //      пользователь не сбросит вручную.
+    //
+    // Что логируем:
+    //   - Object.keys(Lampa.Timeline) и сэмплы view/get/update
+    //   - Сэмплы Lampa.Storage.get(<key>) для всех правдоподобных ключей
+    //   - Если в массиве book / card есть сериал — по его tmdb id ищем
+    //     записи в этих ключах, которые ссылаются на него (sample of 5).
+    var _episodeDumped = false;
+    function dumpEpisodeInternalsOnce() {
+        try {
+            var once = false;
+            var always = false;
+            try { once   = !!Lampa.Storage.get('trakt_dump_episodes_once', false); } catch (e) {}
+            try { always = !!Lampa.Storage.get('trakt_dump_episodes',      false); } catch (e) {}
+            if (!once && !always) return;
+            if (_episodeDumped && !always) return;
+            _episodeDumped = true;
+            if (once) {
+                try { Lampa.Storage.set('trakt_dump_episodes_once', false); } catch (e) {}
+            }
+            log('=== dumpEpisodeInternalsOnce: старт (v' + VERSION + ') ===');
+
+            // 1. Lampa.Timeline
+            try {
+                if (Lampa && Lampa.Timeline) {
+                    log('Timeline keys', Object.keys(Lampa.Timeline));
+                    ['view', 'get', 'update', 'all', 'load', 'save'].forEach(function (m) {
+                        if (typeof Lampa.Timeline[m] === 'function') {
+                            log('Timeline.' + m + ' src',
+                                String(Lampa.Timeline[m]).slice(0, 400));
+                        }
+                    });
+                } else {
+                    warn('Lampa.Timeline отсутствует');
+                }
+            } catch (e) { warn('Timeline dump failed', e); }
+
+            // 2. Перебор правдоподобных ключей Lampa.Storage
+            var KEYS = [
+                'file_view',
+                'online_view',
+                'view',
+                'view_episodes',
+                'episodes_view',
+                'episodes_watched',
+                'episode_view',
+                'show_view',
+                'series_view',
+                'continues',
+                'continue',
+                'card_view',
+                'movie_view',
+                'history',
+                'timeline'
+            ];
+            KEYS.forEach(function (k) {
+                try {
+                    var v = Lampa.Storage.get(k, null);
+                    if (v == null) return;
+                    var info = { type: typeof v };
+                    if (Array.isArray(v)) {
+                        info.length = v.length;
+                        info.sample = v.slice(0, 3);
+                    } else if (typeof v === 'object') {
+                        var keys = Object.keys(v);
+                        info.objKeys = keys.length;
+                        info.firstKeys = keys.slice(0, 5);
+                        // Покажем первое значение целиком, чтобы увидеть shape
+                        if (keys.length) info.firstValue = v[keys[0]];
+                    } else {
+                        info.value = v;
+                    }
+                    log('Storage[' + k + ']', info);
+                } catch (e) { warn('Storage[' + k + '] dump failed', e); }
+            });
+
+            // 3. Полный список ключей в Lampa.Storage (если есть метод)
+            try {
+                if (Lampa.Storage && typeof Lampa.Storage.cache === 'function') {
+                    log('Storage.cache src', String(Lampa.Storage.cache).slice(0, 400));
+                }
+                // Иногда есть Lampa.Storage.all() / Lampa.Storage.field_keys
+                ['all', 'fields', 'getAll'].forEach(function (m) {
+                    try {
+                        if (Lampa.Storage && typeof Lampa.Storage[m] === 'function') {
+                            var out = Lampa.Storage[m]();
+                            log('Storage.' + m + '() keys',
+                                out && typeof out === 'object'
+                                    ? Object.keys(out).slice(0, 50)
+                                    : typeof out);
+                        }
+                    } catch (e) {}
+                });
+                // localStorage — там Lampa может хранить ключи под префиксом
+                if (typeof localStorage !== 'undefined') {
+                    var lsKeys = [];
+                    for (var i = 0; i < localStorage.length; i++) {
+                        var lk = localStorage.key(i);
+                        if (lk && /view|episode|watch|history|timeline|continue/i.test(lk)) {
+                            lsKeys.push(lk);
+                        }
+                    }
+                    log('localStorage matching keys', lsKeys.slice(0, 30));
+                }
+            } catch (e) { warn('Storage meta dump failed', e); }
+
+            log('=== dumpEpisodeInternalsOnce: готово ===');
+            log('Если нужный ключ найден, сообщите его имя и дальше пишем v0.9.0.');
+        } catch (e) {
+            warn('dumpEpisodeInternalsOnce failed', e);
+        }
+    }
+
     // Перед расстановкой mark'ов снимаем конфликтующие статусы у тех id,
     // которые в desired попадают в одну папку. Lampa хранит mark'и каждой
     // карточки многозначно (book/look/viewed/continued/...): если карточка
@@ -1048,6 +1179,9 @@
         if (!hasToken())  { log('syncStatusFolders: нет токена');            return; }
         _syncingStatus = true;
         log('syncStatusFolders: старт');
+
+        // v0.9.0-rc1: разовый дамп где Lampa хранит per-episode "просмотрено".
+        dumpEpisodeInternalsOnce();
 
         computeStatusFolders().then(function (desired) {
             log('статусы рассчитаны', {
