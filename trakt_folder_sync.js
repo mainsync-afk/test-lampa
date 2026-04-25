@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.9.0-rc2';
+    var VERSION         = '0.9.0-rc3';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
@@ -935,19 +935,11 @@
     //   - Сэмплы Lampa.Storage.get(<key>) для всех правдоподобных ключей
     //   - Если в массиве book / card есть сериал — по его tmdb id ищем
     //     записи в этих ключах, которые ссылаются на него (sample of 5).
-    var _episodeDumped = false;
     function dumpEpisodeInternalsOnce() {
+        // rc3: дамп безусловный при каждом открытии Избранного. Это
+        // диагностический rc — после получения нужных данных вернёмся
+        // к флагам и уберём общий вывод.
         try {
-            var once = false;
-            var always = false;
-            try { once   = !!Lampa.Storage.get('trakt_dump_episodes_once', false); } catch (e) {}
-            try { always = !!Lampa.Storage.get('trakt_dump_episodes',      false); } catch (e) {}
-            if (!once && !always) return;
-            if (_episodeDumped && !always) return;
-            _episodeDumped = true;
-            if (once) {
-                try { Lampa.Storage.set('trakt_dump_episodes_once', false); } catch (e) {}
-            }
             log('=== dumpEpisodeInternalsOnce: старт (v' + VERSION + ') ===');
 
             // 1. Lampa.Timeline — главное место где живёт «просмотрено».
