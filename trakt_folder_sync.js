@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.8.6';
+    var VERSION         = '0.8.7';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
@@ -833,6 +833,83 @@
         });
     }
 
+    // Поиск реальной карточки по tmdb id во всех известных папках Lampa.
+    // Lampa.Favorite хранит mark отдельно от содержимого папки: для снятия
+    // mark Favorite.remove(folder, card) должен получить ту самую карточку,
+    // что лежит в storage marks (со всеми полями, как её туда положили), а
+    // не тощий stub. Лог 0.8.6 (Running Point): мы передавали stub —
+    // listener event приходил, но Favorite.check после remove всё равно
+    // отдавал mark=true. Подсмотрено у trakt_by_lampame — у них в
+    // removeConflictingMarks card берётся из mapTraktToLampaCard (полная).
+    //
+    // Здесь мы пробегаем по всем известным папкам Lampa и берём первую
+    // карточку с подходящим tmdb id. Если не нашли — возвращаем null,
+    // тогда вызывающий код сам решит, что делать (использовать stub или
+    // пропустить).
+    var ALL_KNOWN_FOLDERS = [
+        'book', 'like', 'wath', 'history', 'look', 'viewed',
+        'continued', 'thrown', 'scheduled', 'card'
+    ];
+    function findRealCard(id) {
+        if (!Lampa.Favorite || typeof Lampa.Favorite.get !== 'function') return null;
+        var sid = String(id);
+        for (var i = 0; i < ALL_KNOWN_FOLDERS.length; i++) {
+            var folder = ALL_KNOWN_FOLDERS[i];
+            var arr;
+            try { arr = Lampa.Favorite.get({ type: folder }) || []; }
+            catch (e) { continue; }
+            for (var j = 0; j < arr.length; j++) {
+                var c = arr[j];
+                if (!c) continue;
+                var cid = (c.ids && c.ids.tmdb) || c.id;
+                if (cid != null && String(cid) === sid) return c;
+            }
+        }
+        return null;
+    }
+
+    // Один раз за сессию выводим в лог внутреннее устройство Lampa.Favorite,
+    // чтобы понять, где живут marks и почему Favorite.remove(folder, stub)
+    // не снимает их (см. диагностику бага Running Point, 0.8.6 → 0.8.7).
+    var _favoriteDumped = false;
+    function dumpFavoriteInternalsOnce() {
+        if (_favoriteDumped) return;
+        _favoriteDumped = true;
+        if (!Lampa.Favorite) { warn('Lampa.Favorite отсутствует'); return; }
+        try {
+            log('Favorite keys', Object.keys(Lampa.Favorite));
+        } catch (e) {}
+        try {
+            log('Favorite.remove src', String(Lampa.Favorite.remove));
+        } catch (e) {}
+        try {
+            log('Favorite.add src', String(Lampa.Favorite.add).slice(0, 600));
+        } catch (e) {}
+        try {
+            log('Favorite.check src', String(Lampa.Favorite.check).slice(0, 600));
+        } catch (e) {}
+        try {
+            var fav = Lampa.Storage.get('favorite');
+            var dump = {};
+            ['book', 'like', 'wath', 'history', 'look', 'viewed',
+             'continued', 'thrown', 'scheduled', 'card'].forEach(function (k) {
+                if (fav && fav[k]) {
+                    var arr = fav[k];
+                    dump[k] = Array.isArray(arr) ? arr.length : typeof arr;
+                }
+            });
+            log('Storage.get(favorite) shape', { keys: fav ? Object.keys(fav) : null, sizes: dump });
+            // Если есть карточка 244623 — выложим её
+            if (fav && fav.card && Array.isArray(fav.card)) {
+                var match = fav.card.find(function (c) {
+                    var cid = (c && c.ids && c.ids.tmdb) || (c && c.id);
+                    return cid != null && String(cid) === '244623';
+                });
+                if (match) log('Storage.favorite.card[244623]', match);
+            }
+        } catch (e) { warn('dumpFavoriteInternals failed', e); }
+    }
+
     // Перед расстановкой mark'ов снимаем конфликтующие статусы у тех id,
     // которые в desired попадают в одну папку. Lampa хранит mark'и каждой
     // карточки многозначно (book/look/viewed/continued/...): если карточка
@@ -841,16 +918,18 @@
     // фаерит listener, но в практике не всегда чистит mark — карточка
     // возвращается на следующей итерации (см. лог Running Point, 0.8.5).
     //
-    // Паттерн взят из trakt_by_lampame: делаем Lampa.Favorite.check(stub),
-    // получаем объект {folder: bool, ...}, и принудительно снимаем те
-    // статусные mark'и, которых не должно быть. Так переводим карточку из
-    // одного статуса в другой одним детерминированным шагом.
+    // С 0.8.7 ищем настоящую карточку через findRealCard (по всем папкам).
+    // Если она есть, передаём её в Favorite.remove — это тот же объект,
+    // что Lampa положила в свой mark-storage. Если нет — fallback на stub
+    // (старое поведение из 0.8.6, для случая когда карточка лежит только
+    // под нашим stub'ом).
     function enforceStatusExclusivity(desired) {
         if (!Lampa.Favorite || typeof Lampa.Favorite.check !== 'function' ||
             typeof Lampa.Favorite.remove !== 'function') {
             warn('enforceStatusExclusivity: Lampa.Favorite.check недоступен');
             return;
         }
+        dumpFavoriteInternalsOnce();
         var intended = {};
         STATUS_FOLDERS.forEach(function (f) {
             (desired[f] || []).forEach(function (c) {
@@ -859,14 +938,15 @@
         });
         Object.keys(intended).forEach(function (id) {
             var keep = intended[id];
-            var stub = {
-                id:        id,
+            var real = findRealCard(id);
+            var probe = real || {
+                id:        Number(id),
                 ids:       { tmdb: Number(id) },
                 method:    'tv',
                 card_type: 'tv'
             };
             var status;
-            try { status = Lampa.Favorite.check(stub) || {}; }
+            try { status = Lampa.Favorite.check(probe) || {}; }
             catch (e) {
                 warn('enforceStatusExclusivity: check ошибка', { id: id, err: e });
                 return;
@@ -875,15 +955,40 @@
                 if (other === keep) return;
                 if (!status[other]) return;
                 log('enforceStatusExclusivity: чищу дубль статуса', {
-                    id: id, removeFrom: other, keep: keep
+                    id: id, removeFrom: other, keep: keep,
+                    cardSource: real ? 'real' : 'stub'
                 });
                 markOwn(id);
-                try { Lampa.Favorite.remove(other, stub); }
+                try { Lampa.Favorite.remove(other, probe); }
                 catch (e) {
                     warn('enforceStatusExclusivity: remove ошибка', {
                         id: id, folder: other, err: e
                     });
                 }
+                // Сразу проверяем, снялся ли mark. Если не снялся — пробуем
+                // ещё раз с альтернативной формой id (Number ↔ String).
+                try {
+                    var after = Lampa.Favorite.check(probe) || {};
+                    if (after[other]) {
+                        var alt = real ? null : {
+                            id:        String(id),
+                            ids:       { tmdb: Number(id) },
+                            method:    'tv',
+                            card_type: 'tv'
+                        };
+                        log('enforceStatusExclusivity: mark не снят, пробую альт', {
+                            id: id, folder: other, hadReal: !!real
+                        });
+                        if (alt) {
+                            markOwn(id);
+                            try { Lampa.Favorite.remove(other, alt); } catch (e2) {}
+                            var after2 = Lampa.Favorite.check(probe) || {};
+                            log('enforceStatusExclusivity: после альт remove', {
+                                id: id, folder: other, stillMark: !!after2[other]
+                            });
+                        }
+                    }
+                } catch (e) {}
             });
         });
     }
@@ -903,25 +1008,33 @@
         var dirty = 0;
         Object.keys(intended).forEach(function (id) {
             var keep = intended[id];
-            var stub = {
-                id:        id,
+            var real = findRealCard(id);
+            var probe = real || {
+                id:        Number(id),
                 ids:       { tmdb: Number(id) },
                 method:    'tv',
                 card_type: 'tv'
             };
             var status;
-            try { status = Lampa.Favorite.check(stub) || {}; }
+            try { status = Lampa.Favorite.check(probe) || {}; }
             catch (e) { return; }
             STATUS_FOLDERS.forEach(function (other) {
                 if (other === keep) return;
                 if (!status[other]) return;
                 dirty++;
                 log('verifyStatusFoldersClean: дубль остался — чищу', {
-                    id: id, removeFrom: other, keep: keep
+                    id: id, removeFrom: other, keep: keep,
+                    cardSource: real ? 'real' : 'stub'
                 });
                 markOwn(id);
-                try { Lampa.Favorite.remove(other, stub); }
+                try { Lampa.Favorite.remove(other, probe); }
                 catch (e) { warn('verify remove err', { id: id, folder: other, err: e }); }
+                try {
+                    var after = Lampa.Favorite.check(probe) || {};
+                    log('verifyStatusFoldersClean: после remove', {
+                        id: id, folder: other, stillMark: !!after[other]
+                    });
+                } catch (e) {}
             });
         });
         if (dirty) log('verifyStatusFoldersClean: чисток', dirty);
