@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.9.0-rc1';
+    var VERSION         = '0.9.0-rc2';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
@@ -950,20 +950,80 @@
             }
             log('=== dumpEpisodeInternalsOnce: старт (v' + VERSION + ') ===');
 
-            // 1. Lampa.Timeline
+            // 1. Lampa.Timeline — главное место где живёт «просмотрено».
+            // Дампим ВСЕ методы целиком, чтобы понять API и какой hash
+            // используется для эпизодов. Из rc1 знаем что есть watched,
+            // watchedEpisode, view, update, read, format, details.
             try {
                 if (Lampa && Lampa.Timeline) {
                     log('Timeline keys', Object.keys(Lampa.Timeline));
-                    ['view', 'get', 'update', 'all', 'load', 'save'].forEach(function (m) {
-                        if (typeof Lampa.Timeline[m] === 'function') {
-                            log('Timeline.' + m + ' src',
-                                String(Lampa.Timeline[m]).slice(0, 400));
-                        }
+                    Object.keys(Lampa.Timeline).forEach(function (m) {
+                        try {
+                            var v = Lampa.Timeline[m];
+                            if (typeof v === 'function') {
+                                // Без обрезки — пусть будет полный исходник.
+                                log('Timeline.' + m + ' src', String(v));
+                            } else if (v && typeof v === 'object') {
+                                log('Timeline.' + m + ' obj keys',
+                                    Object.keys(v));
+                            }
+                        } catch (e) {}
                     });
+                    // Если у listener есть зарегистрированные события —
+                    // вытащим их, чтобы понять какие подписки доступны.
+                    try {
+                        var lst = Lampa.Timeline.listener;
+                        if (lst) {
+                            log('Timeline.listener keys', Object.keys(lst));
+                            ['follow', 'send', 'remove'].forEach(function (m) {
+                                if (typeof lst[m] === 'function') {
+                                    log('Timeline.listener.' + m + ' src',
+                                        String(lst[m]).slice(0, 600));
+                                }
+                            });
+                            // Внутреннее хранилище подписок может называться
+                            // по-разному — выводим всё что не функция.
+                            Object.keys(lst).forEach(function (k) {
+                                var v = lst[k];
+                                if (typeof v !== 'function') {
+                                    try {
+                                        log('Timeline.listener.' + k,
+                                            v && typeof v === 'object'
+                                                ? Object.keys(v)
+                                                : v);
+                                    } catch (e) {}
+                                }
+                            });
+                        }
+                    } catch (e) { warn('Timeline.listener dump failed', e); }
                 } else {
                     warn('Lampa.Timeline отсутствует');
                 }
             } catch (e) { warn('Timeline dump failed', e); }
+
+            // 1b. Полное содержимое file_view + проба Timeline.view/read
+            // для каждого хэша. Это покажет shape хэша и какая разница
+            // между .view и .read (если она есть).
+            try {
+                var fv = Lampa.Storage.get('file_view', null);
+                if (fv && typeof fv === 'object') {
+                    log('file_view full', fv);
+                    Object.keys(fv).slice(0, 10).forEach(function (h) {
+                        try {
+                            if (typeof Lampa.Timeline.view === 'function') {
+                                log('Timeline.view(' + h + ')',
+                                    Lampa.Timeline.view(h));
+                            }
+                        } catch (e) {}
+                        try {
+                            if (typeof Lampa.Timeline.read === 'function') {
+                                log('Timeline.read(' + h + ')',
+                                    Lampa.Timeline.read(h));
+                            }
+                        } catch (e) {}
+                    });
+                }
+            } catch (e) { warn('file_view full dump failed', e); }
 
             // 2. Перебор правдоподобных ключей Lampa.Storage
             var KEYS = [
