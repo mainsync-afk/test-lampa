@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.8.5';
+    var VERSION         = '0.8.6';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
@@ -833,6 +833,100 @@
         });
     }
 
+    // Перед расстановкой mark'ов снимаем конфликтующие статусы у тех id,
+    // которые в desired попадают в одну папку. Lampa хранит mark'и каждой
+    // карточки многозначно (book/look/viewed/continued/...): если карточка
+    // была в continued, а пользователь руками поставил её в viewed, оба
+    // флага останутся проставлены. Per-folder Favorite.remove(folder, card)
+    // фаерит listener, но в практике не всегда чистит mark — карточка
+    // возвращается на следующей итерации (см. лог Running Point, 0.8.5).
+    //
+    // Паттерн взят из trakt_by_lampame: делаем Lampa.Favorite.check(stub),
+    // получаем объект {folder: bool, ...}, и принудительно снимаем те
+    // статусные mark'и, которых не должно быть. Так переводим карточку из
+    // одного статуса в другой одним детерминированным шагом.
+    function enforceStatusExclusivity(desired) {
+        if (!Lampa.Favorite || typeof Lampa.Favorite.check !== 'function' ||
+            typeof Lampa.Favorite.remove !== 'function') {
+            warn('enforceStatusExclusivity: Lampa.Favorite.check недоступен');
+            return;
+        }
+        var intended = {};
+        STATUS_FOLDERS.forEach(function (f) {
+            (desired[f] || []).forEach(function (c) {
+                if (c && c.id != null) intended[String(c.id)] = f;
+            });
+        });
+        Object.keys(intended).forEach(function (id) {
+            var keep = intended[id];
+            var stub = {
+                id:        id,
+                ids:       { tmdb: Number(id) },
+                method:    'tv',
+                card_type: 'tv'
+            };
+            var status;
+            try { status = Lampa.Favorite.check(stub) || {}; }
+            catch (e) {
+                warn('enforceStatusExclusivity: check ошибка', { id: id, err: e });
+                return;
+            }
+            STATUS_FOLDERS.forEach(function (other) {
+                if (other === keep) return;
+                if (!status[other]) return;
+                log('enforceStatusExclusivity: чищу дубль статуса', {
+                    id: id, removeFrom: other, keep: keep
+                });
+                markOwn(id);
+                try { Lampa.Favorite.remove(other, stub); }
+                catch (e) {
+                    warn('enforceStatusExclusivity: remove ошибка', {
+                        id: id, folder: other, err: e
+                    });
+                }
+            });
+        });
+    }
+
+    // Финальная страховка после Promise.all: пробегаемся по desired и если
+    // mark всё ещё стоит не в той папке — снимаем. Per-folder syncStatusFolder
+    // ставит add'ы и remove'ы параллельно; если Lampa асинхронно вернула
+    // карточку в чужую папку между шагами — ловим это здесь.
+    function verifyStatusFoldersClean(desired) {
+        if (!Lampa.Favorite || typeof Lampa.Favorite.check !== 'function') return;
+        var intended = {};
+        STATUS_FOLDERS.forEach(function (f) {
+            (desired[f] || []).forEach(function (c) {
+                if (c && c.id != null) intended[String(c.id)] = f;
+            });
+        });
+        var dirty = 0;
+        Object.keys(intended).forEach(function (id) {
+            var keep = intended[id];
+            var stub = {
+                id:        id,
+                ids:       { tmdb: Number(id) },
+                method:    'tv',
+                card_type: 'tv'
+            };
+            var status;
+            try { status = Lampa.Favorite.check(stub) || {}; }
+            catch (e) { return; }
+            STATUS_FOLDERS.forEach(function (other) {
+                if (other === keep) return;
+                if (!status[other]) return;
+                dirty++;
+                log('verifyStatusFoldersClean: дубль остался — чищу', {
+                    id: id, removeFrom: other, keep: keep
+                });
+                markOwn(id);
+                try { Lampa.Favorite.remove(other, stub); }
+                catch (e) { warn('verify remove err', { id: id, folder: other, err: e }); }
+            });
+        });
+        if (dirty) log('verifyStatusFoldersClean: чисток', dirty);
+    }
+
     var _syncingStatus = false;
 
     function syncStatusFolders() {
@@ -864,11 +958,21 @@
                     };
                 }));
             });
+            // Перед per-folder синхронизациями: снимаем конфликтующие статусы
+            // у тех id, у которых mark стоит не в той папке, что в desired.
+            // Без этого Lampa может «вернуть» карточку обратно между
+            // итерациями syncStatusFolder (см. v0.8.6 changelog).
+            enforceStatusExclusivity(desired);
             return Promise.all([
                 syncStatusFolder('look',      desired.look),
                 syncStatusFolder('viewed',    desired.viewed),
                 syncStatusFolder('continued', desired.continued)
-            ]);
+            ]).then(function (res) {
+                // Финальная страховка: если что-то осталось грязным после
+                // параллельных Promise — добиваем здесь.
+                verifyStatusFoldersClean(desired);
+                return res;
+            });
         }).then(function () {
             _syncingStatus = false;
             log('syncStatusFolders: готово');
