@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.8.3';
+    var VERSION         = '0.8.4';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
@@ -348,6 +348,62 @@
 
     var _syncingBook = false;
 
+    // Удаляет из Trakt watchlist «двойников» — пары, где один и тот же
+    // tmdb id присутствует и как movie, и как show. Это след бага 0.5.x–0.8.3:
+    // мы слали /sync/watchlist с id одновременно в movies и shows, рассчитывая
+    // что Trakt разрешит ровно одну сущность, — но TMDB id пересекаются между
+    // movies и shows (это РАЗНЫЕ namespace, но один и тот же номер часто
+    // занят и фильмом, и сериалом), и Trakt добавлял обе.
+    //
+    // Что удаляем: тип, которого нет в local Lampa book для этого id. Если
+    // в Lampa книге нет карточки с этим id вообще — не трогаем (мало ли,
+    // пользователь сам в Trakt-вебе добавил оба).
+    function cleanupWatchlistDuplicates(rawMovies, rawShows) {
+        var movieIds = new Set();
+        var showIds  = new Set();
+        rawMovies.forEach(function (it) {
+            var id = it && it.movie && it.movie.ids && it.movie.ids.tmdb;
+            if (id != null) movieIds.add(String(id));
+        });
+        rawShows.forEach(function (it) {
+            var id = it && it.show && it.show.ids && it.show.ids.tmdb;
+            if (id != null) showIds.add(String(id));
+        });
+        var dups = [];
+        movieIds.forEach(function (id) { if (showIds.has(id)) dups.push(id); });
+        if (!dups.length) return;
+
+        var local = Lampa.Favorite.get({ type: 'book' }) || [];
+        var localTypeById = {};
+        local.forEach(function (c) {
+            var lid = tmdbId(c);
+            if (!lid) return;
+            localTypeById[lid] = cardIsShow(c) ? 'show' : 'movie';
+        });
+
+        dups.forEach(function (id) {
+            var localType = localTypeById[id];
+            if (!localType) {
+                warn('watchlist cleanup: пара movie+show, в Lampa нет — пропуск', { id: id });
+                return;
+            }
+            var unwanted = (localType === 'show') ? 'movie' : 'show';
+            var body = (unwanted === 'movie')
+                ? { movies: [{ ids: { tmdb: Number(id) } }] }
+                : { shows:  [{ ids: { tmdb: Number(id) } }] };
+            log('watchlist cleanup: удаляем дубль', { id: id, removeType: unwanted, keepType: localType });
+            traktFetch('/sync/watchlist/remove', { method: 'POST', body: body })
+                .then(function (resp) {
+                    log('watchlist cleanup ok', { id: id, removeType: unwanted, resp: resp });
+                })['catch'](function (err) {
+                    warn('watchlist cleanup failed', {
+                        id: id, removeType: unwanted,
+                        status: err && err.status, response: err && err.response
+                    });
+                });
+        });
+    }
+
     function syncBook() {
         if (_syncingBook) { log('syncBook: уже идёт, пропуск'); return; }
         if (!isEnabled()) { log('syncBook: синхронизация отключена'); return; }
@@ -360,8 +416,18 @@
             traktFetch('/users/me/watchlist/movies'),
             traktFetch('/users/me/watchlist/shows')
         ]).then(function (results) {
-            var rawItems = (Array.isArray(results[0]) ? results[0] : [])
-                     .concat(Array.isArray(results[1]) ? results[1] : []);
+            var rawMovies = Array.isArray(results[0]) ? results[0] : [];
+            var rawShows  = Array.isArray(results[1]) ? results[1] : [];
+            var rawItems  = rawMovies.concat(rawShows);
+
+            // Чистим наследованные дубли «movie+show с одним tmdb id» (баг
+            // 0.5.x–0.8.3, см. buildWatchlistBody): такие пары появлялись,
+            // когда мы слали add сразу в обе корзины Trakt, и Trakt находил
+            // обе сущности (TMDB id у фильма и сериала независимы, но часто
+            // пересекаются по числу). Огонь и забыли — наш собственный dedup
+            // по tmdb id маскировал пару в diff'е, и мусор оставался в Trakt
+            // навсегда. Вычищаем тип, которого нет в local Lampa book.
+            cleanupWatchlistDuplicates(rawMovies, rawShows);
 
             // Строим желаемое множество — тощие карточки с TMDB id.
             var desired = [];
@@ -786,19 +852,21 @@
     // версии. Добавление/удаление карточки в Lampa отправляем в Trakt
     // через POST /sync/watchlist[/remove], затем кладём Pending Op.
 
-    // Собираем body для /sync/watchlist[/remove].
-    // Отправляем id СРАЗУ в обоих массивах — movies и shows. TMDB id
-    // namespaced per type, так что Trakt найдёт ровно одну сущность;
-    // лишний объект уйдёт в not_found и проигнорируется.
-    // Фактический тип определяется по полю added/deleted в ответе —
-    // см. pushWatchlist. Эвристика cardIsShow оставлена только для
-    // предварительного лога и в write-пути больше не используется.
-    function buildWatchlistBody(card) {
-        var id = tmdbId(card);
-        if (!id) return null;
+    // Собираем body для /sync/watchlist[/remove] под уже определённый тип.
+    //
+    // ВАЖНО: type должен быть 'show' или 'movie'. До 0.8.4 мы слали id
+    // одновременно в shows и movies, надеясь, что неподходящий тип уйдёт
+    // в not_found. Это неверно: TMDB id 124364 (например) одновременно
+    // существует как movie («Dangerous Obsession», 1989) и как show — это
+    // разные сущности в разных namespaces TMDB. Trakt находил обе и добавлял
+    // обе в watchlist, после чего наш собственный dedup по tmdb id маскировал
+    // дубль в local diff'е и мусор оставался в Trakt навсегда.
+    function buildWatchlistBody(id, type) {
+        if (!id || (type !== 'show' && type !== 'movie')) return null;
         var entry = { ids: { tmdb: Number(id) } };
-        var body  = { movies: [entry], shows: [entry] };
-        return { body: body, guessedType: cardIsShow(card) ? 'show' : 'movie', id: id };
+        return type === 'show'
+            ? { shows:  [entry] }
+            : { movies: [entry] };
     }
 
     // Извлекаем фактический тип (movie/show) из ответа Trakt по /sync/watchlist.
@@ -839,48 +907,67 @@
 
     function pushWatchlist(action, card) {
         if (!hasToken()) return;
-        var built = buildWatchlistBody(card);
-        if (!built) { warn('pushWatchlist: нет tmdb id', card); return; }
+        var id = tmdbId(card);
+        if (!id) { warn('pushWatchlist: нет tmdb id', card); return; }
 
-        if (checkWriteDedup(action, 'book', built.id)) return;
+        if (checkWriteDedup(action, 'book', id)) return;
 
+        // Резолвим тип ДО отправки. resolveCardType сначала смотрит на
+        // method/card_type/media_type/number_of_seasons (для нормальных
+        // карточек, добавленных через UI Lampa, — мгновенный ответ), и
+        // только для тощих случаев идёт в /search/tmdb/:id. Слать в обе
+        // корзины (как было в 0.5.x–0.8.3) нельзя: TMDB id может означать
+        // и фильм, и сериал одновременно — Trakt тогда добавит обоих.
         var path = action === 'remove' ? '/sync/watchlist/remove' : '/sync/watchlist';
-        traktFetch(path, { method: 'POST', body: built.body })
-            .then(function (data) {
-                var actualType = resolveTypeFromTraktResp(data, action);
-                if (!actualType) {
-                    // Trakt ответил 200/201, но ни movies, ни shows не
-                    // добавились/удалились — скорее всего id неизвестен
-                    // (not_found) или Trakt посчитал запись уже существующей.
-                    // Для add: проверяем existing как «уже было» — это ок.
-                    var existing = data && data.existing;
-                    if (action === 'add' && existing &&
-                        ((existing.movies || 0) > 0 || (existing.shows || 0) > 0)) {
-                        actualType = (existing.movies || 0) > 0 ? 'movie' : 'show';
-                        log('watchlist add — уже было в Trakt', { id: built.id, type: actualType });
-                    } else {
-                        warn('watchlist ' + action + ' — Trakt не распознал id', {
-                            id: built.id, resp: data
-                        });
-                        return;
+        var guessedType = cardIsShow(card) ? 'show' : 'movie';
+
+        resolveCardType(card).then(function (type) {
+            if (type !== 'show' && type !== 'movie') {
+                // /search/tmdb не нашёл, и поля карточки ничего не сказали.
+                // Fallback на эвристику cardIsShow (как было до 0.5.2 для
+                // book) — лучше отправить хоть что-то, чем потерять действие.
+                warn('pushWatchlist: тип не определён, fallback на эвристику', {
+                    id: id, guessed: guessedType
+                });
+                type = guessedType;
+            }
+            var body = buildWatchlistBody(id, type);
+            if (!body) { warn('pushWatchlist: пустое body', { id: id, type: type }); return; }
+
+            traktFetch(path, { method: 'POST', body: body })
+                .then(function (data) {
+                    var actualType = resolveTypeFromTraktResp(data, action) || type;
+                    var bucket = data && data[action === 'remove' ? 'deleted' : 'added'];
+                    var changed = bucket && ((bucket.movies || 0) > 0 || (bucket.shows || 0) > 0);
+                    if (!changed) {
+                        // Для add: «existing» = уже было в Trakt — ок.
+                        var existing = data && data.existing;
+                        if (action === 'add' && existing &&
+                            ((existing.movies || 0) > 0 || (existing.shows || 0) > 0)) {
+                            log('watchlist add — уже было в Trakt', { id: id, type: actualType });
+                        } else {
+                            warn('watchlist ' + action + ' — Trakt не распознал id', {
+                                id: id, type: type, resp: data
+                            });
+                            return;
+                        }
                     }
-                }
-                log('watchlist ' + action + ' ok', {
-                    id: built.id, type: actualType,
-                    guessed: built.guessedType, resp: data
+                    log('watchlist ' + action + ' ok', {
+                        id: id, type: actualType, guessed: guessedType, resp: data
+                    });
+                    addPendingOp({
+                        id:     id,
+                        type:   actualType,
+                        folder: 'book',
+                        action: action
+                    });
+                })['catch'](function (err) {
+                    warn('watchlist ' + action + ' failed', {
+                        id: id, type: type, guessed: guessedType,
+                        status: err && err.status, response: err && err.response
+                    });
                 });
-                addPendingOp({
-                    id:     built.id,
-                    type:   actualType,
-                    folder: 'book',
-                    action: action
-                });
-            })['catch'](function (err) {
-                warn('watchlist ' + action + ' failed', {
-                    id: built.id, guessed: built.guessedType,
-                    status: err && err.status, response: err && err.response
-                });
-            });
+        });
     }
 
     // -----------------------------------------------------------------------
