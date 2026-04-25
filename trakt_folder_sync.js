@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.9.1-rc2';
+    var VERSION         = '0.9.1';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
