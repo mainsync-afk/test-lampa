@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.9.0-rc3';
+    var VERSION         = '0.9.0';
 
     var SYNC_TAG        = 'TraktFolderSync';
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
@@ -910,189 +910,6 @@
         } catch (e) { warn('dumpFavoriteInternals failed', e); }
     }
 
-    // -------------------------------------------------------------------
-    // v0.9.0-rc1 диагностика: где Lampa хранит per-episode "просмотрено"?
-    // -------------------------------------------------------------------
-    // Lampa.Favorite — карточно-уровневая (book/look/viewed/...), эпизодов
-    // там нет. Чужой плагин trakt_by_lampame ловит только playback-события
-    // (Lampa.Timeline.listener('update') + Lampa.Player.listener('ended'))
-    // и шлёт POST /sync/history при доигрывании серии. Ручная галочка
-    // «просмотрено» на отдельной серии и снятие галочки в нём не
-    // обрабатываются.
-    //
-    // Чтобы реализовать v0.9.0 (двусторонний sync per-episode), нам надо
-    // понять, какой Lampa.Storage-ключ хранит факт «эта серия отмечена»
-    // и какова форма записи. Этот дамп — разовый, не делает запросов и
-    // ничего не пишет. Активация двумя путями:
-    //   1) Lampa.Storage.set('trakt_dump_episodes_once', true)  — затем
-    //      открыть Избранное; флаг сбрасывается после дампа.
-    //   2) Lampa.Storage.set('trakt_dump_episodes', true)       — дампит
-    //      каждый раз (для отладки в нескольких сериалах подряд), пока
-    //      пользователь не сбросит вручную.
-    //
-    // Что логируем:
-    //   - Object.keys(Lampa.Timeline) и сэмплы view/get/update
-    //   - Сэмплы Lampa.Storage.get(<key>) для всех правдоподобных ключей
-    //   - Если в массиве book / card есть сериал — по его tmdb id ищем
-    //     записи в этих ключах, которые ссылаются на него (sample of 5).
-    function dumpEpisodeInternalsOnce() {
-        // rc3: дамп безусловный при каждом открытии Избранного. Это
-        // диагностический rc — после получения нужных данных вернёмся
-        // к флагам и уберём общий вывод.
-        try {
-            log('=== dumpEpisodeInternalsOnce: старт (v' + VERSION + ') ===');
-
-            // 1. Lampa.Timeline — главное место где живёт «просмотрено».
-            // Дампим ВСЕ методы целиком, чтобы понять API и какой hash
-            // используется для эпизодов. Из rc1 знаем что есть watched,
-            // watchedEpisode, view, update, read, format, details.
-            try {
-                if (Lampa && Lampa.Timeline) {
-                    log('Timeline keys', Object.keys(Lampa.Timeline));
-                    Object.keys(Lampa.Timeline).forEach(function (m) {
-                        try {
-                            var v = Lampa.Timeline[m];
-                            if (typeof v === 'function') {
-                                // Без обрезки — пусть будет полный исходник.
-                                log('Timeline.' + m + ' src', String(v));
-                            } else if (v && typeof v === 'object') {
-                                log('Timeline.' + m + ' obj keys',
-                                    Object.keys(v));
-                            }
-                        } catch (e) {}
-                    });
-                    // Если у listener есть зарегистрированные события —
-                    // вытащим их, чтобы понять какие подписки доступны.
-                    try {
-                        var lst = Lampa.Timeline.listener;
-                        if (lst) {
-                            log('Timeline.listener keys', Object.keys(lst));
-                            ['follow', 'send', 'remove'].forEach(function (m) {
-                                if (typeof lst[m] === 'function') {
-                                    log('Timeline.listener.' + m + ' src',
-                                        String(lst[m]).slice(0, 600));
-                                }
-                            });
-                            // Внутреннее хранилище подписок может называться
-                            // по-разному — выводим всё что не функция.
-                            Object.keys(lst).forEach(function (k) {
-                                var v = lst[k];
-                                if (typeof v !== 'function') {
-                                    try {
-                                        log('Timeline.listener.' + k,
-                                            v && typeof v === 'object'
-                                                ? Object.keys(v)
-                                                : v);
-                                    } catch (e) {}
-                                }
-                            });
-                        }
-                    } catch (e) { warn('Timeline.listener dump failed', e); }
-                } else {
-                    warn('Lampa.Timeline отсутствует');
-                }
-            } catch (e) { warn('Timeline dump failed', e); }
-
-            // 1b. Полное содержимое file_view + проба Timeline.view/read
-            // для каждого хэша. Это покажет shape хэша и какая разница
-            // между .view и .read (если она есть).
-            try {
-                var fv = Lampa.Storage.get('file_view', null);
-                if (fv && typeof fv === 'object') {
-                    log('file_view full', fv);
-                    Object.keys(fv).slice(0, 10).forEach(function (h) {
-                        try {
-                            if (typeof Lampa.Timeline.view === 'function') {
-                                log('Timeline.view(' + h + ')',
-                                    Lampa.Timeline.view(h));
-                            }
-                        } catch (e) {}
-                        try {
-                            if (typeof Lampa.Timeline.read === 'function') {
-                                log('Timeline.read(' + h + ')',
-                                    Lampa.Timeline.read(h));
-                            }
-                        } catch (e) {}
-                    });
-                }
-            } catch (e) { warn('file_view full dump failed', e); }
-
-            // 2. Перебор правдоподобных ключей Lampa.Storage
-            var KEYS = [
-                'file_view',
-                'online_view',
-                'view',
-                'view_episodes',
-                'episodes_view',
-                'episodes_watched',
-                'episode_view',
-                'show_view',
-                'series_view',
-                'continues',
-                'continue',
-                'card_view',
-                'movie_view',
-                'history',
-                'timeline'
-            ];
-            KEYS.forEach(function (k) {
-                try {
-                    var v = Lampa.Storage.get(k, null);
-                    if (v == null) return;
-                    var info = { type: typeof v };
-                    if (Array.isArray(v)) {
-                        info.length = v.length;
-                        info.sample = v.slice(0, 3);
-                    } else if (typeof v === 'object') {
-                        var keys = Object.keys(v);
-                        info.objKeys = keys.length;
-                        info.firstKeys = keys.slice(0, 5);
-                        // Покажем первое значение целиком, чтобы увидеть shape
-                        if (keys.length) info.firstValue = v[keys[0]];
-                    } else {
-                        info.value = v;
-                    }
-                    log('Storage[' + k + ']', info);
-                } catch (e) { warn('Storage[' + k + '] dump failed', e); }
-            });
-
-            // 3. Полный список ключей в Lampa.Storage (если есть метод)
-            try {
-                if (Lampa.Storage && typeof Lampa.Storage.cache === 'function') {
-                    log('Storage.cache src', String(Lampa.Storage.cache).slice(0, 400));
-                }
-                // Иногда есть Lampa.Storage.all() / Lampa.Storage.field_keys
-                ['all', 'fields', 'getAll'].forEach(function (m) {
-                    try {
-                        if (Lampa.Storage && typeof Lampa.Storage[m] === 'function') {
-                            var out = Lampa.Storage[m]();
-                            log('Storage.' + m + '() keys',
-                                out && typeof out === 'object'
-                                    ? Object.keys(out).slice(0, 50)
-                                    : typeof out);
-                        }
-                    } catch (e) {}
-                });
-                // localStorage — там Lampa может хранить ключи под префиксом
-                if (typeof localStorage !== 'undefined') {
-                    var lsKeys = [];
-                    for (var i = 0; i < localStorage.length; i++) {
-                        var lk = localStorage.key(i);
-                        if (lk && /view|episode|watch|history|timeline|continue/i.test(lk)) {
-                            lsKeys.push(lk);
-                        }
-                    }
-                    log('localStorage matching keys', lsKeys.slice(0, 30));
-                }
-            } catch (e) { warn('Storage meta dump failed', e); }
-
-            log('=== dumpEpisodeInternalsOnce: готово ===');
-            log('Если нужный ключ найден, сообщите его имя и дальше пишем v0.9.0.');
-        } catch (e) {
-            warn('dumpEpisodeInternalsOnce failed', e);
-        }
-    }
-
     // Перед расстановкой mark'ов снимаем конфликтующие статусы у тех id,
     // которые в desired попадают в одну папку. Lampa хранит mark'и каждой
     // карточки многозначно (book/look/viewed/continued/...): если карточка
@@ -1231,9 +1048,6 @@
         if (!hasToken())  { log('syncStatusFolders: нет токена');            return; }
         _syncingStatus = true;
         log('syncStatusFolders: старт');
-
-        // v0.9.0-rc1: разовый дамп где Lampa хранит per-episode "просмотрено".
-        dumpEpisodeInternalsOnce();
 
         computeStatusFolders().then(function (desired) {
             log('статусы рассчитаны', {
@@ -1653,6 +1467,306 @@
         }
     }
 
+    // -----------------------------------------------------------------------
+    // v0.9.0: синхронизация просмотра отдельных серий
+    // -----------------------------------------------------------------------
+    //
+    // Что делает чужой плагин trakt_by_lampame и что — НЕ делает:
+    //   ✅ Отметка серии в Lampa → POST /sync/history (через scrobble на
+    //      Timeline.listener('update') когда percent ≥ trakt_min_progress).
+    //   ❌ Снятие галочки в Lampa → не шлёт ничего: scrobble обрабатывает
+    //      только marking, не unmarking.
+    //   ❌ Trakt → Lampa (любое направление) — чужой плагин Trakt history
+    //      на предмет эпизодов не читает и в Lampa file_view не пишет.
+    //
+    // Закрываем оба пробела. Подход (минимально нагрузочный, выбран
+    // пользователем над snapshot-вариантом):
+    //
+    //   1) Pull-based reconcile при открытии Избранного: для каждого
+    //      сериала из Lampa Favorites тянем /shows/:id/progress/watched
+    //      и приводим Lampa file_view к Trakt (Trakt = source of truth).
+    //   2) Listener на Lampa.Timeline 'update' с percent=0 → POST
+    //      /sync/history/remove. Так ловим ровно тот edge, который
+    //      чужой плагин пропускает.
+    //
+    // Защита от петли self-write: при записи в Lampa передаём
+    // received: true. Чужой плагин в processTimelineUpdate читает этот
+    // флаг — наша запись не трактуется как user playback и в Trakt
+    // повторно не уходит.
+    //
+    // Защита от ложного снятия в reconcile: когда user только что
+    // отметил серию в Lampa, но чужой плагин ещё не успел отправить в
+    // Trakt — наш reconcile может ошибочно увидеть Lampa✓/Trakt✗ и
+    // снять отметку обратно. Чтобы этого не было, держим pending-буфер
+    // _pendingLampaMark с TTL 60 сек: только что отмеченные user'ом
+    // серии не унмаркаем при reconcile.
+
+    var LAMPA_WATCHED_THRESHOLD = 90; // percent ≥ 90 ⇒ "просмотрено"
+    var EPISODE_SYNC_PENDING_TTL_MS = 60 * 1000;
+    var _syncingEpisodes = false;
+    var _episodeHashIndex = {};   // hash → { tmdb, season, episode, name }
+    var _pendingLampaMark = {};   // hash → ts (defense от unmark race)
+
+    // Hash как считает Lampa.Timeline.watchedEpisode:
+    //   Utils.hash([season, season>10?':':'', episode, original_name].join(''))
+    function episodeHash(season, episode, originalName) {
+        if (!originalName) return null;
+        if (!Lampa.Utils || typeof Lampa.Utils.hash !== 'function') return null;
+        try {
+            var sep = season > 10 ? ':' : '';
+            return Lampa.Utils.hash([season, sep, episode, originalName].join(''));
+        } catch (e) { return null; }
+    }
+
+    function fileViewKey() {
+        try {
+            if (Lampa.Timeline && typeof Lampa.Timeline.filename === 'function') {
+                return Lampa.Timeline.filename();
+            }
+        } catch (e) {}
+        return 'file_view';
+    }
+
+    function isWatchedInLampa(season, episode, originalName) {
+        var h = episodeHash(season, episode, originalName);
+        if (!h) return false;
+        var fv = Lampa.Storage.get(fileViewKey(), {}) || {};
+        var entry = fv[h];
+        if (!entry || typeof entry !== 'object') return false;
+        return Number(entry.percent || 0) >= LAMPA_WATCHED_THRESHOLD;
+    }
+
+    function markEpisodeInLampa(season, episode, originalName) {
+        var h = episodeHash(season, episode, originalName);
+        if (!h) return false;
+        if (!Lampa.Timeline || typeof Lampa.Timeline.update !== 'function') return false;
+        try {
+            Lampa.Timeline.update({
+                hash:     h,
+                percent:  100,
+                time:     0,
+                duration: 0,
+                profile:  0,
+                received: true   // флаг для чужого плагина: не scrobble
+            });
+            return true;
+        } catch (e) {
+            warn('markEpisodeInLampa failed', e);
+            return false;
+        }
+    }
+
+    function unmarkEpisodeInLampa(season, episode, originalName) {
+        var h = episodeHash(season, episode, originalName);
+        if (!h) return false;
+        var key = fileViewKey();
+        var fv = Lampa.Storage.get(key, {}) || {};
+        if (!fv[h]) return false;
+        try {
+            delete fv[h];
+            Lampa.Storage.set(key, fv);
+            // UI refresh: эмулируем 'update' с percent=0. received:true,
+            // чтобы чужой плагин не воспринял как scrobble (а у нас по
+            // условию <threshold всё равно бы не сработало, но на всякий).
+            if (Lampa.Timeline && Lampa.Timeline.listener &&
+                typeof Lampa.Timeline.listener.send === 'function') {
+                Lampa.Timeline.listener.send('update', {
+                    received: true,
+                    data: { hash: h, road: { percent: 0, time: 0, duration: 0, profile: 0 } }
+                });
+            }
+            return true;
+        } catch (e) {
+            warn('unmarkEpisodeInLampa failed', e);
+            return false;
+        }
+    }
+
+    function isPendingLampaMark(hash) {
+        var ts = _pendingLampaMark[hash];
+        if (!ts) return false;
+        if (Date.now() - ts > EPISODE_SYNC_PENDING_TTL_MS) {
+            delete _pendingLampaMark[hash];
+            return false;
+        }
+        return true;
+    }
+
+    // Перебираем все сериалы из Lampa Favorites (book + look + viewed +
+    // continued + card), берём те что выглядят как сериал (method='tv'
+    // или есть original_name — у фильмов original_title), дёргаем у
+    // Trakt /shows/:id/progress/watched, диффим и применяем.
+    function collectShowsFromFavorites() {
+        var fav = Lampa.Storage.get('favorite', {}) || {};
+        var pool = {};
+        ['book', 'look', 'viewed', 'continued', 'card'].forEach(function (folder) {
+            var arr = fav[folder];
+            if (!Array.isArray(arr)) return;
+            arr.forEach(function (c) {
+                if (!c) return;
+                var tmdb = c.id || (c.ids && c.ids.tmdb);
+                if (!tmdb) return;
+                var name = c.original_name || c.name;
+                if (!name) return;
+                // Эвристика "это сериал". method='tv' / number_of_seasons /
+                // origin_country (для shows ≠ movies). На тощих карточках
+                // полей нет — пропускаем; reconcile подцепит позже когда
+                // карточка обогатится.
+                var looksShow = c.method === 'tv' ||
+                                !!c.number_of_seasons ||
+                                !!c.original_name; // у фильмов original_title
+                if (!looksShow) return;
+                if (!pool[String(tmdb)]) pool[String(tmdb)] = c;
+            });
+        });
+        return pool;
+    }
+
+    function syncEpisodesForShow(card, progress) {
+        var name = card.original_name || card.name;
+        var tmdb = card.id || (card.ids && card.ids.tmdb);
+        if (!name) return { added: 0, removed: 0, skipped: true };
+        var seasons = (progress && progress.seasons) || [];
+        var added = 0, removed = 0, pendingSkipped = 0;
+        seasons.forEach(function (s) {
+            if (!s || s.number === 0) return;       // specials skip
+            var snum = s.number;
+            (s.episodes || []).forEach(function (e) {
+                if (!e || e.number == null) return;
+                var enum_ = e.number;
+                var traktWatched = !!e.completed;
+                var lampaWatched = isWatchedInLampa(snum, enum_, name);
+                if (traktWatched && !lampaWatched) {
+                    if (markEpisodeInLampa(snum, enum_, name)) added++;
+                } else if (!traktWatched && lampaWatched) {
+                    var h = episodeHash(snum, enum_, name);
+                    if (h && isPendingLampaMark(h)) {
+                        pendingSkipped++;
+                        return;
+                    }
+                    if (unmarkEpisodeInLampa(snum, enum_, name)) removed++;
+                }
+                // Заодно поддерживаем реверс-индекс — он нужен для
+                // обработки unmark в Lampa (handleLampaUnmark матчит hash).
+                var idxH = episodeHash(snum, enum_, name);
+                if (idxH) _episodeHashIndex[idxH] = {
+                    tmdb: tmdb, season: snum, episode: enum_, name: name
+                };
+            });
+        });
+        return { added: added, removed: removed, pendingSkipped: pendingSkipped };
+    }
+
+    function syncEpisodesAll() {
+        if (!isEnabled())   return;
+        if (!hasToken())    return;
+        if (_syncingEpisodes) {
+            log('syncEpisodes: уже идёт, пропуск');
+            return;
+        }
+        _syncingEpisodes = true;
+        log('syncEpisodes: старт');
+
+        var pool = collectShowsFromFavorites();
+        var ids = Object.keys(pool);
+        if (!ids.length) {
+            _syncingEpisodes = false;
+            log('syncEpisodes: нет сериалов в Favorites');
+            return;
+        }
+        log('syncEpisodes: сериалов к проверке', ids.length);
+
+        var totalAdded = 0, totalRemoved = 0;
+        var promises = ids.map(function (id) {
+            return traktFetch('/shows/' + id + '/progress/watched')
+                .then(function (progress) {
+                    if (!progress) return;
+                    var r = syncEpisodesForShow(pool[id], progress);
+                    if (r && (r.added || r.removed)) {
+                        log('syncEpisodes: сериал ' + (pool[id].name || id), {
+                            tmdb: id, added: r.added, removed: r.removed
+                        });
+                        totalAdded   += r.added;
+                        totalRemoved += r.removed;
+                    }
+                })['catch'](function (err) {
+                    warn('syncEpisodes: progress failed', {
+                        tmdb: id, status: err && err.status
+                    });
+                });
+        });
+        Promise.all(promises).then(function () {
+            _syncingEpisodes = false;
+            log('syncEpisodes: готово', { added: totalAdded, removed: totalRemoved });
+        });
+    }
+
+    // Listener на Timeline 'update': ловим снятие галочки в Lampa
+    // (percent=0). Чужой плагин этот случай не обрабатывает.
+    // Параллельно для percent ≥ threshold — записываем pending-буфер,
+    // чтобы reconcile не снял отметку которую только что поставили.
+    function initEpisodeListener() {
+        if (!Lampa.Timeline || !Lampa.Timeline.listener ||
+            typeof Lampa.Timeline.listener.follow !== 'function') {
+            warn('initEpisodeListener: Lampa.Timeline.listener недоступен');
+            return;
+        }
+        Lampa.Timeline.listener.follow('update', function (e) {
+            if (!isEnabled()) return;
+            if (!e || !e.data) return;
+            // Наш собственный send (received:true) не трогаем — иначе
+            // зацикливание на Trakt remove после нашего же unmark в Lampa.
+            if (e.received) return;
+            var hash    = e.data.hash;
+            var road    = e.data.road || {};
+            var percent = Number(road.percent || 0);
+            if (!hash) return;
+
+            if (percent >= LAMPA_WATCHED_THRESHOLD) {
+                _pendingLampaMark[hash] = Date.now();
+            } else if (percent === 0) {
+                // Снятие галочки в Lampa. Шлём в Trakt /sync/history/remove.
+                handleLampaUnmark(hash);
+            }
+            // Иные значения (1..89) — playback-progress, нас не интересует
+            // (марком не считаем, но и снятием тоже).
+        });
+        log('initEpisodeListener: подписан на Timeline.update');
+    }
+
+    function handleLampaUnmark(hash) {
+        var info = _episodeHashIndex[hash];
+        if (!info) {
+            // Hash не в индексе — это серия которую мы ещё не индексировали
+            // (reconcile не успел отработать после установки плагина).
+            // Молча пропускаем — следующий reconcile построит индекс и со
+            // следующего unmark всё заработает.
+            return;
+        }
+        log('episode unmark в Lampa → Trakt', info);
+        var body = {
+            shows: [{
+                ids: { tmdb: Number(info.tmdb) },
+                seasons: [{
+                    number:   info.season,
+                    episodes: [{ number: info.episode }]
+                }]
+            }]
+        };
+        traktFetch('/sync/history/remove', { method: 'POST', body: body })
+            .then(function (r) {
+                log('Trakt /sync/history/remove ok', {
+                    tmdb: info.tmdb, season: info.season, episode: info.episode,
+                    deleted: r && r.deleted
+                });
+            })['catch'](function (err) {
+                warn('Trakt /sync/history/remove failed', {
+                    tmdb: info.tmdb, season: info.season, episode: info.episode,
+                    status: err && err.status
+                });
+            });
+    }
+
     function initFavoriteListener() {
         if (!Lampa.Favorite || !Lampa.Favorite.listener ||
             typeof Lampa.Favorite.listener.follow !== 'function') {
@@ -1713,9 +1827,10 @@
             if (!e || e.type !== 'start') return;
             var activity = e.object || {};
             if (activity.component !== 'bookmarks') return;
-            log('bookmarks открыт → syncBook + syncStatusFolders');
+            log('bookmarks открыт → syncBook + syncStatusFolders + syncEpisodes');
             syncBook();
             syncStatusFolders();
+            syncEpisodesAll();
         });
     }
 
@@ -1789,6 +1904,7 @@
         log('Готов', { version: VERSION, enabled: isEnabled() });
         initFavoriteListener();
         initActivityListener();
+        initEpisodeListener();
 
         // Диагностика: какой Trakt-аккаунт стоит за этим токеном. Разовый
         // запрос при старте, не влияет на горячий путь. Поможет отловить
