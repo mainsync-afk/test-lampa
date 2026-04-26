@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.11.0';
+    var VERSION         = '0.11.1';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // С 0.11.0: thrown ↔ персональный Trakt user list «Брошено».
@@ -730,19 +730,60 @@
     // Slug листа кешируется в Lampa.Storage чтобы не ходить за списком
     // листов на каждый цикл.
 
+    // Валидный slug — непустая строка, не «undefined»/«null» (storage Lampa
+    // умеет записывать undefined как одноимённую строку — лог 0.11.0 показал,
+    // что после неудачного create это нагадило в кеш и каждый запрос потом
+    // шёл на /users/me/lists/undefined/items с 404).
+    function isValidSlug(s) {
+        return typeof s === 'string'
+            && s.length > 0
+            && s !== 'undefined'
+            && s !== 'null';
+    }
+
+    function saveThrownListSlug(slug) {
+        if (!isValidSlug(slug)) {
+            warn('saveThrownListSlug: пустой/мусорный slug, не сохраняем',
+                { slug: slug });
+            return null;
+        }
+        Lampa.Storage.set(STORAGE_THROWN_LIST, slug);
+        return slug;
+    }
+
+    function clearThrownListCache(reason) {
+        log('thrown list cache: сброс', { reason: reason });
+        // Lampa.Storage не умеет удалять ключ — пишем пустую строку,
+        // isValidSlug её отвергнет и getThrownListSlug пойдёт в findOrCreate.
+        Lampa.Storage.set(STORAGE_THROWN_LIST, '');
+    }
+
     function getThrownListSlug() {
         var cached = Lampa.Storage.field(STORAGE_THROWN_LIST);
-        if (cached) return Promise.resolve(cached);
+        if (isValidSlug(cached)) {
+            return Promise.resolve(cached);
+        }
+        if (cached) {
+            // в кеше что-то невалидное лежит — чистим, чтобы заново не
+            // считаться валидным truthy
+            clearThrownListCache('invalid cached value: ' + JSON.stringify(cached));
+        }
         return findOrCreateThrownList();
     }
 
     function findOrCreateThrownList() {
         return traktFetch('/users/me/lists').then(function (lists) {
+            log('thrown list: GET /users/me/lists', {
+                count: Array.isArray(lists) ? lists.length : 'not-array',
+                names: Array.isArray(lists)
+                    ? lists.map(function (l) { return l && l.name; })
+                    : null
+            });
             if (Array.isArray(lists)) {
                 for (var i = 0; i < lists.length; i++) {
                     var l = lists[i];
-                    if (l && l.name === THROWN_LIST_NAME && l.ids && l.ids.slug) {
-                        Lampa.Storage.set(STORAGE_THROWN_LIST, l.ids.slug);
+                    if (l && l.name === THROWN_LIST_NAME && l.ids && isValidSlug(l.ids.slug)) {
+                        saveThrownListSlug(l.ids.slug);
                         log('thrown list найден', { slug: l.ids.slug });
                         return l.ids.slug;
                     }
@@ -762,20 +803,29 @@
             sort_by:          'rank',
             sort_how:         'asc'
         };
+        log('thrown list: POST /users/me/lists', { body: body });
         return traktFetch('/users/me/lists', { method: 'POST', body: body })
             .then(function (created) {
-                if (!created || !created.ids || !created.ids.slug) {
-                    throw new Error('createThrownList: пустой ответ Trakt');
+                log('thrown list: POST ответ', { created: created });
+                var slug = created && created.ids && created.ids.slug;
+                if (!isValidSlug(slug)) {
+                    throw new Error(
+                        'createThrownList: ответ Trakt без валидного slug — ' +
+                        JSON.stringify(created)
+                    );
                 }
-                Lampa.Storage.set(STORAGE_THROWN_LIST, created.ids.slug);
-                log('thrown list создан', { slug: created.ids.slug });
-                return created.ids.slug;
+                saveThrownListSlug(slug);
+                log('thrown list создан', { slug: slug });
+                return slug;
             });
     }
 
     // GET /users/me/lists/:slug/items.
     // Возвращает массив записей с type='show'|'movie' — резолвим обе ветки,
     // чтобы computeStatusFolders мог положить в desired.thrown оба типа.
+    //
+    // На 404 чистим кеш slug: значит лист удалён или slug в кеше
+    // протух. Следующий цикл вызовет findOrCreateThrownList и пересоздаст.
     function fetchThrownListItems() {
         return getThrownListSlug()
             .then(function (slug) {
@@ -798,6 +848,9 @@
                 });
                 return rows;
             })['catch'](function (err) {
+                if (err && err.status === 404) {
+                    clearThrownListCache('GET items 404');
+                }
                 warn('fetchThrownListItems failed', {
                     status:  err && err.status,
                     message: err && err.message
@@ -1601,12 +1654,22 @@
             ? { movies: [{ ids: { tmdb: idNum } }] }
             : { shows:  [{ ids: { tmdb: idNum } }] };
 
-        var listP = getThrownListSlug().then(function (slug) {
-            var path = action === 'remove'
-                ? '/users/me/lists/' + slug + '/items/remove'
-                : '/users/me/lists/' + slug + '/items';
-            return traktFetch(path, { method: 'POST', body: listBody });
-        });
+        var listP = getThrownListSlug()
+            .then(function (slug) {
+                var path = action === 'remove'
+                    ? '/users/me/lists/' + slug + '/items/remove'
+                    : '/users/me/lists/' + slug + '/items';
+                return traktFetch(path, { method: 'POST', body: listBody })
+                    ['catch'](function (err) {
+                        // 404 = slug в кеше уже не существует в Trakt
+                        // (лист удалили). Сбрасываем кеш — следующий цикл
+                        // вызовет findOrCreate и пересоздаст.
+                        if (err && err.status === 404) {
+                            clearThrownListCache('list write 404');
+                        }
+                        throw err;
+                    });
+            });
 
         // helper для CW — только сериалы.
         var dropP = Promise.resolve(null);
@@ -1618,8 +1681,6 @@
             dropP = traktFetch(dropPath, { method: 'POST', body: dropBody })
                 ['catch'](function (err) {
                     // helper не критичен: основной эффект даёт лист.
-                    // CW не очистится — карточка останется торчать в Up Next,
-                    // но в Trakt-поиске и Lampa.thrown всё равно правильно.
                     warn('thrown drop helper failed (ok, не критично)', {
                         id: id, status: err && err.status
                     });
@@ -1627,17 +1688,30 @@
                 });
         }
 
+        // Pending op кладём НЕЗАВИСИМО от успеха записи в Trakt.
+        //
+        // Зачем: если лист недоступен (slug undefined / прокси не пускает
+        // POST /users/me/lists / нет интернета), на следующем sync
+        // fetchThrownListItems вернёт пустой массив, desired.thrown=0, и
+        // syncStatusFolder('thrown') удалит локальную карточку — пользователь
+        // увидит «положил, потом исчезла». Pending op в Lampa.Storage держит
+        // карточку в desired.thrown пока действует TTL, давая шанс плагину
+        // докричаться до Trakt в следующем цикле.
+        //
+        // Если запись прошла — pending op просто продублирует то, что уже
+        // в Trakt. Если не прошла — даст безопасное окно для recover.
+        addPendingOp({
+            id: id, type: type, folder: 'thrown', action: action
+        });
+
         return Promise.all([listP, dropP])
             .then(function (results) {
                 log('thrown ' + action + ' ok', {
                     id: id, type: type,
                     list: results[0], drop: results[1]
                 });
-                addPendingOp({
-                    id: id, type: type, folder: 'thrown', action: action
-                });
             })['catch'](function (err) {
-                warn('thrown ' + action + ' failed', {
+                warn('thrown ' + action + ' failed (pending op сохранён, повторим на следующем sync)', {
                     id: id, type: type,
                     status: err && err.status, response: err && err.response
                 });
