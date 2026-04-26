@@ -8,10 +8,27 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.9.1';
+    var VERSION         = '0.9.2';
 
     var SYNC_TAG        = 'TraktFolderSync';
+    // Папки Lampa, которые плагин read/write-ит к Trakt. По ним строится
+    // желаемое распределение (desired) при классификации сериала и фильма.
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
+    // Полный набор взаимно-исключающих статусных папок Lampa. Шире, чем
+    // STATUS_FOLDERS: плагин эти папки не синхронизирует с Trakt, но они
+    // в UI Лампы взаимно исключают друг друга (нельзя одновременно
+    // «Запланировано» и «Просмотрено»). Используется в exclusivity-проверке
+    // — когда плагин ставит mark в одну из STATUS_FOLDERS, он снимает mark
+    // со всех остальных папок этого набора (включая scheduled/thrown),
+    // чтобы карточка не получила «двойной статус».
+    //
+    // 0.9.2: до этого exclusivity бегала только по STATUS_FOLDERS — юзер
+    // вручную ставил scheduled, плагин классифицировал в look, ставил
+    // look mark, но scheduled оставался → карточка одновременно в
+    // Запланировано и Смотрю. Лог lampa.mx-1777192086909.log показал
+    // воспроизведение для A Dream Within a Dream (id 253193) при отметке
+    // серии в Лампе и для Euphoria (id 85552) при отметке серии в Trakt.
+    var LAMPA_STATUS_FOLDERS = ['look', 'viewed', 'continued', 'scheduled', 'thrown'];
     // Не создаём свой компонент — подмешиваем параметры в уже существующий
     // раздел «Trakt» от плагина trakt_by_lampame / trakttv. В v0.4.0–0.4.1
     // пробовали свой component: 'trakt_folder_sync' — Lampa регистрировала
@@ -951,7 +968,7 @@
                 warn('enforceStatusExclusivity: check ошибка', { id: id, err: e });
                 return;
             }
-            STATUS_FOLDERS.forEach(function (other) {
+            LAMPA_STATUS_FOLDERS.forEach(function (other) {
                 if (other === keep) return;
                 if (!status[other]) return;
                 log('enforceStatusExclusivity: чищу дубль статуса', {
@@ -1018,7 +1035,7 @@
             var status;
             try { status = Lampa.Favorite.check(probe) || {}; }
             catch (e) { return; }
-            STATUS_FOLDERS.forEach(function (other) {
+            LAMPA_STATUS_FOLDERS.forEach(function (other) {
                 if (other === keep) return;
                 if (!status[other]) return;
                 dirty++;
@@ -2062,3 +2079,4 @@
     }
 
 })();
+
