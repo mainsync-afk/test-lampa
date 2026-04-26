@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.10.0-rc2';
+    var VERSION         = '0.10.0-rc3';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // Папки Lampa, которые плагин read/write-ит к Trakt. По ним строится
@@ -1891,7 +1891,9 @@
         if (!hasToken()) return;
         var id = tmdbId(card);
         if (!id) { warn('addThrown: нет tmdb id', card); return; }
-        if (checkWriteDedup('add', 'thrown', id)) return;
+        // Дедуп НЕ зовём — pushHistory уже записал ключ в _recentWrites
+        // ДО того, как нас вызвал. Если позвать тут — попадём на свой же
+        // ключ и весь add отвалится (см. v0.10.0-rc3 fix: THE PITT bug).
 
         resolveCardType(card).then(function (type) {
             var ids  = { tmdb: id };
@@ -1925,7 +1927,7 @@
         if (!hasToken()) return;
         var id = tmdbId(card);
         if (!id) { warn('removeThrown: нет tmdb id', card); return; }
-        if (checkWriteDedup('remove', 'thrown', id)) return;
+        // См. addThrown — дедуп уже отработал в pushHistory.
 
         resolveCardType(card).then(function (type) {
             var ids  = { tmdb: id };
