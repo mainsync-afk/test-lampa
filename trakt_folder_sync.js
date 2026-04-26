@@ -8,17 +8,28 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.10.1';
+    var VERSION         = '0.11.0';
 
     var SYNC_TAG        = 'TraktFolderSync';
-    // С 0.10.1: thrown ↔ Trakt /users/hidden/progress_watched (legacy-секция,
-    // даёт «серая карточка + Restore» в Trakt CW; см. postDropped).
-    // Брошенный сериал должен лежать ровно в одной из этих папок —
-    // enforceStatusExclusivity и verifyStatusFoldersClean уже параметрические
-    // по STATUS_FOLDERS.
+    // С 0.11.0: thrown ↔ персональный Trakt user list «Брошено».
+    // Это «значок папки на постере» в Trakt/Moviebase + поддержка фильмов
+    // (hidden/dropped и hidden/progress_watched были shows-only).
+    // Параллельно при add/remove дёргаем /users/hidden/dropped как helper
+    // для очистки CW в Trakt — чтобы брошенный сериал не торчал в Up Next
+    // (помощник касается только сериалов, фильмам в CW делать нечего).
+    // Истории просмотров и watched-state не трогаем — лист их не трогает,
+    // hidden/dropped тоже сохраняет.
+    //
+    // Брошенный сериал должен лежать ровно в одной из STATUS_FOLDERS —
+    // enforceStatusExclusivity и verifyStatusFoldersClean уже параметрические.
     // У Lampa MARK-набор по факту шире (есть ещё scheduled), но в Trakt
     // прямого аналога scheduled нет — оставляем без синхронизации.
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued', 'thrown'];
+
+    // Имя кастомного листа в Trakt. Создаём при первом write, если такого
+    // ещё нет. Slug кешируется в Lampa.Storage чтобы не ходить в /users/me/lists
+    // на каждый цикл.
+    var THROWN_LIST_NAME = 'Брошено';
     // Не создаём свой компонент — подмешиваем параметры в уже существующий
     // раздел «Trakt» от плагина trakt_by_lampame / trakttv. В v0.4.0–0.4.1
     // пробовали свой component: 'trakt_folder_sync' — Lampa регистрировала
@@ -28,6 +39,7 @@
     var STORAGE_LOGGING     = 'trakt_enable_logging';
     var STORAGE_PENDING     = 'trakt_folder_sync_pending';
     var STORAGE_PENDING_TTL = 'trakt_folder_sync_pending_ttl';
+    var STORAGE_THROWN_LIST = 'trakt_folder_sync_thrown_list_slug';
 
     // Базовый URL — тот же прокси, что использует trakt_by_lampame. Прокси
     // подставляет trakt-api-key на сервере, поэтому прямой api.trakt.tv без
@@ -700,42 +712,93 @@
         });
     }
 
-    // Список «брошенных» сериалов из Trakt.
-    // GET /users/hidden/progress_watched?type=show.
+    // -----------------------------------------------------------------------
+    // Кастомный Trakt user list «Брошено» (v0.11.0)
+    // -----------------------------------------------------------------------
     //
-    // Trakt-эндпоинтов hidden несколько; разница в визуальном эффекте в Trakt UI:
-    //   • /users/hidden/dropped — новая фича (анонс март 2025, «Drop Show»).
-    //     Полностью убирает сериал из CW / Progress / Up Next / Calendar.
-    //     В Trakt UI карточка просто исчезает с CW. Это то, что делает
-    //     кнопка «Drop Show» в самом Trakt UI.
-    //   • /users/hidden/progress_watched — старая, легаси, «Hide from Progress».
-    //     В Trakt UI карточка остаётся в CW, но рисуется серой с кнопкой Restore.
-    //     Этот эффект пользователь видел при «Stop Watching» в Moviebase —
-    //     Moviebase, вероятно, шлёт именно сюда. История просмотров не теряется.
+    // Почему лист, а не hidden-секции:
+    //   • lists поддерживают и фильмы, и сериалы (hidden/dropped и
+    //     hidden/progress_watched — shows-only).
+    //   • в Trakt-поиске и Moviebase карточка из листа получает значок папки
+    //     на постере — это видимый сигнал «брошено» вне CW.
+    //   • листом владеем мы: hidden-секции зашумлены чужими интеграциями.
     //
-    // С 0.10.1 переключились на progress_watched как более близкий к ожидаемому
-    // поведению (карточка не исчезает из Trakt CW, а помечается серой).
+    // Для очистки CW параллельно с записью в лист зовём
+    // /users/hidden/dropped — это helper-эндпоинт, не источник правды.
+    // Он касается только сериалов; фильмам в CW делать нечего.
     //
-    // limit=500: дефолт у Trakt = 10, на форуме сообщали о потере данных при
-    // больших списках. С запасом достаточно для типичного пользователя.
-    function fetchDroppedShows() {
-        return traktFetch('/users/hidden/progress_watched?type=show&limit=500')
+    // Slug листа кешируется в Lampa.Storage чтобы не ходить за списком
+    // листов на каждый цикл.
+
+    function getThrownListSlug() {
+        var cached = Lampa.Storage.field(STORAGE_THROWN_LIST);
+        if (cached) return Promise.resolve(cached);
+        return findOrCreateThrownList();
+    }
+
+    function findOrCreateThrownList() {
+        return traktFetch('/users/me/lists').then(function (lists) {
+            if (Array.isArray(lists)) {
+                for (var i = 0; i < lists.length; i++) {
+                    var l = lists[i];
+                    if (l && l.name === THROWN_LIST_NAME && l.ids && l.ids.slug) {
+                        Lampa.Storage.set(STORAGE_THROWN_LIST, l.ids.slug);
+                        log('thrown list найден', { slug: l.ids.slug });
+                        return l.ids.slug;
+                    }
+                }
+            }
+            return createThrownList();
+        });
+    }
+
+    function createThrownList() {
+        var body = {
+            name:             THROWN_LIST_NAME,
+            description:      'Brosheno — синхронизация из Lampa (trakt_folder_sync)',
+            privacy:          'private',
+            display_numbers:  false,
+            allow_comments:   false,
+            sort_by:          'rank',
+            sort_how:         'asc'
+        };
+        return traktFetch('/users/me/lists', { method: 'POST', body: body })
+            .then(function (created) {
+                if (!created || !created.ids || !created.ids.slug) {
+                    throw new Error('createThrownList: пустой ответ Trakt');
+                }
+                Lampa.Storage.set(STORAGE_THROWN_LIST, created.ids.slug);
+                log('thrown list создан', { slug: created.ids.slug });
+                return created.ids.slug;
+            });
+    }
+
+    // GET /users/me/lists/:slug/items.
+    // Возвращает массив записей с type='show'|'movie' — резолвим обе ветки,
+    // чтобы computeStatusFolders мог положить в desired.thrown оба типа.
+    function fetchThrownListItems() {
+        return getThrownListSlug()
+            .then(function (slug) {
+                return traktFetch('/users/me/lists/' + slug + '/items?limit=500');
+            })
             .then(function (items) {
                 if (!Array.isArray(items)) return [];
                 var rows = [];
                 items.forEach(function (it) {
-                    var s = it && it.show;
-                    if (!s || !s.ids || !s.ids.tmdb) return;
+                    if (!it) return;
+                    var entity = it.show || it.movie;
+                    if (!entity || !entity.ids || !entity.ids.tmdb) return;
                     rows.push({
-                        id:    String(s.ids.tmdb),
-                        ids:   s.ids,
-                        title: s.title || '',
-                        year:  s.year
+                        id:    String(entity.ids.tmdb),
+                        ids:   entity.ids,
+                        type:  it.type === 'movie' ? 'movie' : 'show',
+                        title: entity.title || '',
+                        year:  entity.year
                     });
                 });
                 return rows;
             })['catch'](function (err) {
-                warn('fetchDroppedShows failed', {
+                warn('fetchThrownListItems failed', {
                     status:  err && err.status,
                     message: err && err.message
                 });
@@ -801,33 +864,33 @@
         return Promise.all([
             fetchShowsClassification(),
             fetchWatchedMovies(),
-            fetchDroppedShows()
+            fetchThrownListItems()
         ]).then(function (results) {
-            var shows   = results[0];
-            var movies  = results[1];
-            var dropped = results[2];
+            var shows  = results[0];
+            var movies = results[1];
+            var thrown = results[2];
 
-            // Map id → row для перезаписи: если сериал есть в /users/hidden/dropped,
-            // он уходит в thrown и НЕ должен оставаться в look/viewed/continued.
-            // Watched-история на Trakt при этом сохраняется (это свойство Drop),
-            // поэтому /sync/watched/shows всё равно его вернёт — наша задача
-            // перенаправить его на thrown в desired.
-            var droppedById = {};
-            dropped.forEach(function (d) { droppedById[d.id] = d; });
+            // Лист «Брошено» — источник правды для thrown. Если карточка
+            // (фильм или сериал) есть в листе, она идёт в desired.thrown
+            // и НЕ дублируется в look/viewed/continued. Watched-история
+            // и watchlist-статусы при этом не трогаются — лист их не знает.
+            var thrownById = {};
+            thrown.forEach(function (t) { thrownById[t.id] = t; });
 
             var desired = { look: [], viewed: [], continued: [], thrown: [] };
 
             shows.forEach(function (row) {
-                if (droppedById[row.id]) {
+                if (thrownById[row.id]) {
+                    var t = thrownById[row.id];
                     desired.thrown.push({
                         id:        row.id,
                         ids:       row.ids,
-                        title:     row.title,
-                        year:      row.year,
+                        title:     t.title || row.title,
+                        year:      t.year || row.year,
                         method:    'tv',
                         card_type: 'tv'
                     });
-                    delete droppedById[row.id]; // обработан — больше не сирота
+                    delete thrownById[row.id];
                     return;
                 }
                 desired[row.folder].push({
@@ -840,23 +903,20 @@
                 });
             });
 
-            // Дропнутые сериалы без watched-истории (не приходят в
-            // /sync/watched/shows, но есть в /users/hidden/dropped) —
-            // тоже в thrown. Например, пользователь дропнул сериал, не
-            // успев ничего посмотреть.
-            Object.keys(droppedById).forEach(function (id) {
-                var d = droppedById[id];
-                desired.thrown.push({
-                    id:        d.id,
-                    ids:       d.ids,
-                    title:     d.title,
-                    year:      d.year,
-                    method:    'tv',
-                    card_type: 'tv'
-                });
-            });
-
             movies.forEach(function (m) {
+                if (thrownById[m.id]) {
+                    var t = thrownById[m.id];
+                    desired.thrown.push({
+                        id:        m.id,
+                        ids:       m.ids,
+                        title:     t.title || m.title,
+                        year:      t.year || m.year,
+                        method:    'movie',
+                        card_type: 'movie'
+                    });
+                    delete thrownById[m.id];
+                    return;
+                }
                 desired.viewed.push({
                     id:        m.id,
                     ids:       m.ids,
@@ -864,6 +924,22 @@
                     year:      m.year,
                     method:    'movie',
                     card_type: 'movie'
+                });
+            });
+
+            // Карточки из листа без watched-истории — добавляем «как есть»
+            // (например, фильм, который пользователь пометил «брошено», не
+            // начав смотреть, или сериал без отмеченных эпизодов).
+            Object.keys(thrownById).forEach(function (id) {
+                var t = thrownById[id];
+                var isMovie = t.type === 'movie';
+                desired.thrown.push({
+                    id:        t.id,
+                    ids:       t.ids,
+                    title:     t.title,
+                    year:      t.year,
+                    method:    isMovie ? 'movie' : 'tv',
+                    card_type: isMovie ? 'movie' : 'tv'
                 });
             });
 
@@ -1511,31 +1587,59 @@
         });
     }
 
-    // POST /users/hidden/progress_watched (drop) или
-    // /users/hidden/progress_watched/remove (restore).
-    // Body: { shows: [{ ids: { tmdb: ... } }] }. Trakt сам резолвит TMDB.
+    // Запись действия пользователя в Trakt user list «Брошено».
+    //   • action='add': POST /users/me/lists/:slug/items
+    //   • action='remove': POST /users/me/lists/:slug/items/remove
+    // Body: { shows|movies: [{ ids: { tmdb: ... } }] }.
     //
-    // Используем legacy-секцию progress_watched, а не новую dropped (март 2025):
-    // dropped полностью прячет сериал из Trakt-интерфейса, а progress_watched
-    // оставляет карточку в Continue Watching, делает её серой и показывает
-    // кнопку Restore. Это тот эффект, который дёргает Moviebase кнопкой
-    // Stop Watching и который пользователь хочет повторить.
-    //
-    // История просмотров на Trakt сохраняется в обоих режимах.
-    function postDropped(action, id) {
-        var body = { shows: [{ ids: { tmdb: Number(id) } }] };
-        var path = action === 'remove'
-            ? '/users/hidden/progress_watched/remove'
-            : '/users/hidden/progress_watched';
-        return traktFetch(path, { method: 'POST', body: body })
-            .then(function (resp) {
-                log('dropped ' + action + ' ok', { id: id, resp: resp });
+    // Параллельно для сериалов дёргаем /users/hidden/dropped — чтобы
+    // карточка ушла из Trakt CW (для фильма helper не нужен, фильмы в CW
+    // не висят).
+    function postThrownItem(action, id, type) {
+        var idNum = Number(id);
+        var listBody = type === 'movie'
+            ? { movies: [{ ids: { tmdb: idNum } }] }
+            : { shows:  [{ ids: { tmdb: idNum } }] };
+
+        var listP = getThrownListSlug().then(function (slug) {
+            var path = action === 'remove'
+                ? '/users/me/lists/' + slug + '/items/remove'
+                : '/users/me/lists/' + slug + '/items';
+            return traktFetch(path, { method: 'POST', body: listBody });
+        });
+
+        // helper для CW — только сериалы.
+        var dropP = Promise.resolve(null);
+        if (type === 'show') {
+            var dropPath = action === 'remove'
+                ? '/users/hidden/dropped/remove'
+                : '/users/hidden/dropped';
+            var dropBody = { shows: [{ ids: { tmdb: idNum } }] };
+            dropP = traktFetch(dropPath, { method: 'POST', body: dropBody })
+                ['catch'](function (err) {
+                    // helper не критичен: основной эффект даёт лист.
+                    // CW не очистится — карточка останется торчать в Up Next,
+                    // но в Trakt-поиске и Lampa.thrown всё равно правильно.
+                    warn('thrown drop helper failed (ok, не критично)', {
+                        id: id, status: err && err.status
+                    });
+                    return null;
+                });
+        }
+
+        return Promise.all([listP, dropP])
+            .then(function (results) {
+                log('thrown ' + action + ' ok', {
+                    id: id, type: type,
+                    list: results[0], drop: results[1]
+                });
                 addPendingOp({
-                    id: id, type: 'show', folder: 'thrown', action: action
+                    id: id, type: type, folder: 'thrown', action: action
                 });
             })['catch'](function (err) {
-                warn('dropped ' + action + ' failed', {
-                    id: id, status: err && err.status, response: err && err.response
+                warn('thrown ' + action + ' failed', {
+                    id: id, type: type,
+                    status: err && err.status, response: err && err.response
                 });
             });
     }
@@ -1547,15 +1651,17 @@
         if (checkWriteDedup(action, folder, id)) return;
 
         if (folder === 'thrown') {
-            // Drop в Trakt существует только для сериалов. Резолвим тип через
-            // Trakt — на тощих карточках, которые приходят в Lampa.Favorite
-            // listener при перемещении (без method/card_type/number_of_seasons),
-            // эвристика cardIsShow ненадёжна (см. v0.5.2 для аналогичного
-            // бага в book). Если оказался фильм — игнорируем с логом.
+            // С 0.11.0 thrown — это кастомный Trakt user list, который
+            // поддерживает оба типа. Тип всё равно резолвим через Trakt
+            // (а не по полям карточки), потому что в листенер Lampa часто
+            // приходит тощая карточка без method/card_type — см. 0.5.2/0.8.1.
+            // Если резолв не удался (нет интернета и т.п.) — пишем как
+            // сериал (старое предположение по умолчанию), это безопаснее
+            // фильма: для сериала ещё дёрнется helper /users/hidden/dropped,
+            // и в худшем случае Trakt вернёт 404 — лист всё равно примет.
             resolveCardType(card).then(function (type) {
-                if (type === 'show') { postDropped(action, id); return; }
-                log('thrown — не сериал, в Trakt не шлём',
-                    { id: id, type: type, action: action });
+                var t = (type === 'movie') ? 'movie' : 'show';
+                postThrownItem(action, id, t);
             });
             return;
         }
