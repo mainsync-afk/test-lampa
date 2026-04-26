@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.9.3';
+    var VERSION         = '0.9.4-diag';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // Папки Lampa, которые плагин read/write-ит к Trakt. По ним строится
@@ -266,6 +266,65 @@
                 return data;
             });
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // 0.9.4-diag: разовый снимок Trakt по нескольким ячейкам — нужен для
+    // выяснения, в какую структуру Moviebase пишет «Stop watching». Зонд
+    // read-only, ничего не меняет. Вызывается из настроек (галка «Снять
+    // дамп Trakt»). Юзер делает снимок «до», действует в Moviebase, ждёт
+    // ~60 сек (stale-окно Trakt), делает снимок «после» — diff покажет
+    // ячейку. Когда поймём механизм, эту галку и функцию убираем.
+    // -----------------------------------------------------------------------
+
+    function dumpTraktSnapshot() {
+        var startTs = new Date().toISOString();
+        log('=== TRAKT SNAPSHOT START ===', { version: VERSION, ts: startTs });
+
+        var endpoints = [
+            { path: '/users/me',                                        label: 'me' },
+            { path: '/users/me/lists',                                  label: 'lists' },
+            { path: '/users/hidden/progress_watched?type=show&limit=200', label: 'hidden_progress_watched' },
+            { path: '/users/hidden/dropped?type=show&limit=200',        label: 'hidden_dropped' },
+            { path: '/users/hidden/calendar?type=show&limit=200',       label: 'hidden_calendar' },
+            { path: '/sync/watched/shows',                              label: 'watched_shows' }
+        ];
+
+        // Серийный обход (а не Promise.all) — чтобы порядок в логе совпадал
+        // с порядком эндпоинтов и было удобно diff'ить «до»/«после».
+        var queue = endpoints.slice();
+        function next() {
+            if (!queue.length) {
+                log('=== TRAKT SNAPSHOT END ===', { ts: new Date().toISOString() });
+                return;
+            }
+            var ep = queue.shift();
+            traktFetch(ep.path).then(function (resp) {
+                // Для крупных коллекций лог режется примитивным sample, но
+                // count видим точно — diff'ом по count'у уже можно ловить
+                // факт изменения; sample даст содержимое.
+                var size = Array.isArray(resp) ? resp.length : null;
+                var sample;
+                if (Array.isArray(resp)) {
+                    sample = resp.length <= 60 ? resp : resp.slice(0, 60);
+                } else {
+                    sample = resp;
+                }
+                log('SNAPSHOT ' + ep.label, {
+                    path: ep.path,
+                    count: size,
+                    truncated: (size != null && size > 60),
+                    data: sample
+                });
+            })['catch'](function (err) {
+                warn('SNAPSHOT ' + ep.label + ' failed', {
+                    path: ep.path,
+                    status: err && err.status,
+                    response: err && err.response
+                });
+            }).then(next, next);
+        }
+        next();
     }
 
     // -----------------------------------------------------------------------
@@ -2024,7 +2083,6 @@
                 component: COMPONENT,
                 param: { name: STORAGE_ENABLED, type: 'trigger', 'default': true },
                 field: {
-                    name: 'Синхронизация папок с Trakt (v' + VERSION + ')',
                     description: 'Закладки, Смотрю, Просмотрено, Продолжение следует — отражают состояние Trakt'
                 }
             });
@@ -2055,9 +2113,28 @@
                     description: 'Сколько секунд защищать только что изменённые карточки от отката синхронизацией. Меньше — быстрее тестировать. «Выключено» полностью отключает буфер.'
                 }
             });
-            log('addSettings: ок');
         } catch (e) {
             warn('addSettings: addParam (pending_ttl) ошибка', e);
+        }
+
+        try {
+            Lampa.SettingsApi.addParam({
+                component: COMPONENT,
+                param: { name: 'trakt_folder_sync_diag_dump', type: 'trigger', 'default': false },
+                field: {
+                    name: 'Снять дамп Trakt (диагностика)',
+                    description: 'Read-only снимок ячеек Trakt в лог. Включи — снимется и галка сбросится. Для выяснения совместимости с Moviebase.'
+                },
+                onChange: function (val) {
+                    var on = (val === true || val === 'true' || val === 1 || val === '1');
+                    if (!on) return;
+                    try { Lampa.Storage.set('trakt_folder_sync_diag_dump', false); } catch (e) {}
+                    dumpTraktSnapshot();
+                }
+            });
+            log('addSettings: ок');
+        } catch (e) {
+            warn('addSettings: addParam (diag_dump) ошибка', e);
         }
     }
 
