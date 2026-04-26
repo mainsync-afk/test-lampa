@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.11.1';
+    var VERSION         = '0.11.2';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // С 0.11.0: thrown ↔ персональный Trakt user list «Брошено».
@@ -865,12 +865,20 @@
     // • pending add в папку X → карточка должна быть ТОЛЬКО в X (убираем
     //   id из остальных статусных папок desired; если X не содержит id —
     //   вставляем минимальный stub, чтобы sync не удалил локальную копию).
-    // • pending remove из любой статусной папки → убираем id из всех
-    //   статусных папок desired (карточка не должна нигде появиться).
+    // • pending remove из папки X → убираем id ТОЛЬКО из desired[X].
+    //   Если для того же id есть pending add в другую папку — он положит
+    //   карточку куда надо; если add'а нет — карточка просто исчезает из
+    //   X и в других статусных папках её и так нет (Trakt мог её туда
+    //   ещё не положить).
     //
-    // Причина: Trakt отдаёт устаревшее состояние 5–15 минут после записи,
-    // и без этого классификатор положил бы сериал обратно в ту папку, из
-    // которой пользователь только что увёл.
+    // 0.11.2: до этого remove чистил все STATUS_FOLDERS — и при перетаскивании
+    // look→thrown пара pending ops (thrown=add + look=remove) друг друга
+    // гасила: add клал в thrown, последующий remove чистил всё включая thrown,
+    // и сериал в следующий цикл уезжал «вникуда».
+    //
+    // Причина существования pending ops: Trakt отдаёт устаревшее состояние
+    // 5–15 минут после записи, и без этого классификатор положил бы сериал
+    // обратно в ту папку, из которой пользователь только что увёл.
     function applyStatusPendingOps(desired) {
         var pending = loadPendingOps().filter(function (op) {
             return STATUS_FOLDERS.indexOf(op.folder) >= 0;
@@ -902,10 +910,8 @@
             }
 
             if (op.action === 'remove') {
-                STATUS_FOLDERS.forEach(function (f) {
-                    desired[f] = desired[f].filter(function (c) {
-                        return String(c.id) !== id;
-                    });
+                desired[op.folder] = desired[op.folder].filter(function (c) {
+                    return String(c.id) !== id;
                 });
             }
         });
