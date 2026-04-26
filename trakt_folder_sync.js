@@ -8,12 +8,16 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.9.4-diag';
+    var VERSION         = '0.10.0-rc1';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // Папки Lampa, которые плагин read/write-ит к Trakt. По ним строится
     // желаемое распределение (desired) при классификации сериала и фильма.
-    var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
+    //
+    // 0.10.0: добавлен 'thrown'. Брошено читается как union из трёх ячеек
+    // Trakt (hidden_progress_watched + hidden_dropped + кастомный список),
+    // пишется триплетом в те же три ячейки. См. SPEC.md «Логика Брошено».
+    var STATUS_FOLDERS  = ['look', 'viewed', 'continued', 'thrown'];
     // Полный набор взаимно-исключающих статусных папок Lampa. Шире, чем
     // STATUS_FOLDERS: плагин эти папки не синхронизирует с Trakt, но они
     // в UI Лампы взаимно исключают друг друга (нельзя одновременно
@@ -38,6 +42,18 @@
     var STORAGE_LOGGING     = 'trakt_enable_logging';
     var STORAGE_PENDING     = 'trakt_folder_sync_pending';
     var STORAGE_PENDING_TTL = 'trakt_folder_sync_pending_ttl';
+    // ID кастомного списка Trakt, используемого как «папка Брошено». Хранит
+    // numeric ids.trakt (а не slug), потому что slug меняется при ручном
+    // переименовании списка в UI Trakt, а ids.trakt стабилен. Селектор в
+    // настройках подгружает /users/me/lists и записывает выбранный id сюда.
+    // Значение 0 / отсутствие — селектор не настроен, write-путь Брошено
+    // деградирует до hidden_PW + hidden_DR без записи в кастомный список.
+    var STORAGE_THROWN_LIST_ID = 'trakt_folder_sync_thrown_list_id';
+    // Кеш списков юзера для селектора. Заполняется при открытии настроек
+    // (асинхронно), читается при отрисовке селектора. Структура:
+    // [{ id: 1234567, name: 'Брошено' }, ...]. Хранится в Storage, чтобы при
+    // повторном открытии настроек селектор не был пуст пока fetch не отдаст.
+    var STORAGE_THROWN_LISTS_CACHE = 'trakt_folder_sync_thrown_lists_cache';
 
     // Базовый URL — тот же прокси, что использует trakt_by_lampame. Прокси
     // подставляет trakt-api-key на сервере, поэтому прямой api.trakt.tv без
@@ -266,65 +282,6 @@
                 return data;
             });
         });
-    }
-
-    // -----------------------------------------------------------------------
-    // 0.9.4-diag: разовый снимок Trakt по нескольким ячейкам — нужен для
-    // выяснения, в какую структуру Moviebase пишет «Stop watching». Зонд
-    // read-only, ничего не меняет. Вызывается из настроек (галка «Снять
-    // дамп Trakt»). Юзер делает снимок «до», действует в Moviebase, ждёт
-    // ~60 сек (stale-окно Trakt), делает снимок «после» — diff покажет
-    // ячейку. Когда поймём механизм, эту галку и функцию убираем.
-    // -----------------------------------------------------------------------
-
-    function dumpTraktSnapshot() {
-        var startTs = new Date().toISOString();
-        log('=== TRAKT SNAPSHOT START ===', { version: VERSION, ts: startTs });
-
-        var endpoints = [
-            { path: '/users/me',                                        label: 'me' },
-            { path: '/users/me/lists',                                  label: 'lists' },
-            { path: '/users/hidden/progress_watched?type=show&limit=200', label: 'hidden_progress_watched' },
-            { path: '/users/hidden/dropped?type=show&limit=200',        label: 'hidden_dropped' },
-            { path: '/users/hidden/calendar?type=show&limit=200',       label: 'hidden_calendar' },
-            { path: '/sync/watched/shows',                              label: 'watched_shows' }
-        ];
-
-        // Серийный обход (а не Promise.all) — чтобы порядок в логе совпадал
-        // с порядком эндпоинтов и было удобно diff'ить «до»/«после».
-        var queue = endpoints.slice();
-        function next() {
-            if (!queue.length) {
-                log('=== TRAKT SNAPSHOT END ===', { ts: new Date().toISOString() });
-                return;
-            }
-            var ep = queue.shift();
-            traktFetch(ep.path).then(function (resp) {
-                // Для крупных коллекций лог режется примитивным sample, но
-                // count видим точно — diff'ом по count'у уже можно ловить
-                // факт изменения; sample даст содержимое.
-                var size = Array.isArray(resp) ? resp.length : null;
-                var sample;
-                if (Array.isArray(resp)) {
-                    sample = resp.length <= 60 ? resp : resp.slice(0, 60);
-                } else {
-                    sample = resp;
-                }
-                log('SNAPSHOT ' + ep.label, {
-                    path: ep.path,
-                    count: size,
-                    truncated: (size != null && size > 60),
-                    data: sample
-                });
-            })['catch'](function (err) {
-                warn('SNAPSHOT ' + ep.label + ' failed', {
-                    path: ep.path,
-                    status: err && err.status,
-                    response: err && err.response
-                });
-            }).then(next, next);
-        }
-        next();
     }
 
     // -----------------------------------------------------------------------
@@ -824,39 +781,74 @@
     }
 
     function computeStatusFolders() {
-        return Promise.all([fetchShowsClassification(), fetchWatchedMovies()])
-            .then(function (results) {
-                var shows  = results[0];
-                var movies = results[1];
+        return Promise.all([
+            fetchShowsClassification(),
+            fetchWatchedMovies(),
+            readThrownUnion()
+        ]).then(function (results) {
+            var shows  = results[0];
+            var movies = results[1];
+            var thrown = results[2] || { union: [], sources: {} };
 
-                var desired = { look: [], viewed: [], continued: [] };
+            var desired = { look: [], viewed: [], continued: [], thrown: [] };
 
-                shows.forEach(function (row) {
-                    desired[row.folder].push({
-                        id:        row.id,
-                        ids:       row.ids,
-                        title:     row.title,
-                        year:      row.year,
-                        method:    'tv',
-                        card_type: 'tv'
-                    });
+            shows.forEach(function (row) {
+                desired[row.folder].push({
+                    id:        row.id,
+                    ids:       row.ids,
+                    title:     row.title,
+                    year:      row.year,
+                    method:    'tv',
+                    card_type: 'tv'
                 });
-
-                movies.forEach(function (m) {
-                    desired.viewed.push({
-                        id:        m.id,
-                        ids:       m.ids,
-                        title:     m.title,
-                        year:      m.year,
-                        method:    'movie',
-                        card_type: 'movie'
-                    });
-                });
-
-                applyStatusPendingOps(desired);
-
-                return desired;
             });
+
+            movies.forEach(function (m) {
+                desired.viewed.push({
+                    id:        m.id,
+                    ids:       m.ids,
+                    title:     m.title,
+                    year:      m.year,
+                    method:    'movie',
+                    card_type: 'movie'
+                });
+            });
+
+            // Брошено имеет приоритет: если карточка есть в union — забираем
+            // её из look/viewed/continued и кладём в thrown. Это и есть
+            // классификатор-приоритет: thrown → остальные статусы.
+            // Канонизация (запись в недостающие ячейки) — fire-and-forget.
+            if (thrown.union.length) {
+                var thrownIds = {};
+                thrown.union.forEach(function (it) {
+                    var k = String(it.tmdb);
+                    thrownIds[k] = true;
+
+                    // Если карточка ещё не в desired — добавим. Тип берём
+                    // из union (show/movie); reconcileWatchlistType при
+                    // enrichAndAdd корректно обработает оба.
+                    var isMovie = (it.type === 'movie');
+                    desired.thrown.push({
+                        id:        it.tmdb,
+                        ids:       { tmdb: it.tmdb, trakt: it.trakt },
+                        title:     it.title,
+                        year:      it.year,
+                        method:    isMovie ? 'movie' : 'tv',
+                        card_type: isMovie ? 'movie' : 'tv'
+                    });
+                });
+                ['look', 'viewed', 'continued'].forEach(function (f) {
+                    desired[f] = desired[f].filter(function (c) {
+                        return !thrownIds[String(c.id)];
+                    });
+                });
+                writeCanonizationThrown(thrown.union, thrown.sources);
+            }
+
+            applyStatusPendingOps(desired);
+
+            return desired;
+        });
     }
 
     function syncStatusFolder(folder, desiredList) {
@@ -1129,14 +1121,15 @@
             log('статусы рассчитаны', {
                 look:      desired.look.length,
                 viewed:    desired.viewed.length,
-                continued: desired.continued.length
+                continued: desired.continued.length,
+                thrown:    desired.thrown.length
             });
             // Диагностика: выводим названия и trakt-id, чтобы можно было
             // сверить с тем, что реально лежит в Trakt-аккаунте. Если тут
             // появляются карточки, которых в Trakt-вебе нет, значит токен
             // привязан к другому аккаунту или в Trakt есть рассинхрон
             // между /sync/watched и UI-страницей History.
-            ['look', 'viewed', 'continued'].forEach(function (f) {
+            ['look', 'viewed', 'continued', 'thrown'].forEach(function (f) {
                 if (!desired[f].length) return;
                 log('папка ' + f + ': классифицировано', desired[f].map(function (s) {
                     return {
@@ -1155,7 +1148,8 @@
             return Promise.all([
                 syncStatusFolder('look',      desired.look),
                 syncStatusFolder('viewed',    desired.viewed),
-                syncStatusFolder('continued', desired.continued)
+                syncStatusFolder('continued', desired.continued),
+                syncStatusFolder('thrown',    desired.thrown)
             ]).then(function (res) {
                 // Финальная страховка: если что-то осталось грязным после
                 // параллельных Promise — добиваем здесь.
@@ -1541,6 +1535,383 @@
             });
             return;
         }
+
+        if (folder === 'thrown') {
+            // Триплет в три ячейки Trakt: hidden_progress_watched + hidden_dropped +
+            // кастомный список. Каждая ячейка обслуживает свой клиент (Moviebase
+            // читает hidden_PW, Trakt-веб — hidden_DR, кастомный список даёт
+            // визуальный маркер). См. SPEC.md «Логика Брошено».
+            if (action === 'add')    addThrown(card);
+            else                     removeThrown(card);
+            return;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.10.0: модуль Брошено — три ячейки Trakt + read-union + write-канон.
+    // -----------------------------------------------------------------------
+    //
+    // Зачем три ячейки. Trakt не имеет одного «правильного» поля «брошено».
+    // Разные клиенты пишут «брошено» в разные структуры:
+    //   - Moviebase  «Stop watching» → /users/hidden/progress_watched (H_PW)
+    //   - Trakt-веб  «Drop show»     → /users/hidden/dropped          (H_DR)
+    //   - Lampa      (нет нативно)   → нужен общий источник истины
+    //
+    // Чтобы любой клиент при подключении понимал «сериал брошен», плагин
+    // пишет одновременно в три ячейки и читает union. Кастомный список
+    // (создаётся юзером в Trakt вручную, выбирается в настройках) даёт
+    // визуальный маркер: иконка списка на постере в UI Moviebase / Trakt-веб.
+    //
+    // Идентификация списка — по ids.trakt (числовой), а не по slug. Slug
+    // меняется при ручном переименовании списка в UI Trakt; ids.trakt
+    // стабилен. См. SPEC.md «Логика Брошено».
+    //
+    // Тип карточки. Hidden-эндпоинты Trakt поддерживают только shows.
+    // Movies в Брошено могут попасть только в кастомный список. Если список
+    // не настроен — для фильмов write-путь Брошено деградирует до Pending Op
+    // без записи в Trakt (то есть локально карточка осядет в папке Брошено,
+    // но при reconcile уйдёт обратно по своему классификатору).
+    // -----------------------------------------------------------------------
+
+    function getThrownListId() {
+        try {
+            var v = Lampa.Storage.field(STORAGE_THROWN_LIST_ID);
+            var n = Number(v);
+            return (n > 0) ? n : 0;
+        } catch (e) { return 0; }
+    }
+
+    function getCachedUserLists() {
+        try {
+            var v = Lampa.Storage.get(STORAGE_THROWN_LISTS_CACHE, '[]');
+            var arr = (typeof v === 'string') ? JSON.parse(v) : v;
+            return Array.isArray(arr) ? arr : [];
+        } catch (e) { return []; }
+    }
+
+    function setCachedUserLists(arr) {
+        try {
+            var safe = (Array.isArray(arr) ? arr : []).map(function (x) {
+                return { id: Number(x.id), name: String(x.name || '') };
+            });
+            Lampa.Storage.set(STORAGE_THROWN_LISTS_CACHE, JSON.stringify(safe));
+        } catch (e) {}
+    }
+
+    // GET /users/me/lists — нужно для селектора в настройках. Кешируем
+    // в Storage, чтобы при следующем открытии настроек селектор не был
+    // пуст до завершения сетевого вызова.
+    function fetchUserLists() {
+        if (!hasToken()) return Promise.resolve([]);
+        return traktFetch('/users/me/lists').then(function (lists) {
+            if (!Array.isArray(lists)) return [];
+            var simplified = lists.map(function (l) {
+                return {
+                    id:   l && l.ids && l.ids.trakt,
+                    name: l && l.name
+                };
+            }).filter(function (x) { return x.id && x.name; });
+            setCachedUserLists(simplified);
+            return simplified;
+        })['catch'](function (err) {
+            warn('fetchUserLists failed', {
+                status:   err && err.status,
+                response: err && err.response
+            });
+            return getCachedUserLists();
+        });
+    }
+
+    // Read-helpers для трёх ячеек. Все возвращают плоский массив объектов
+    // вида { tmdb, trakt, type, title, year } — этого достаточно для union.
+    // type = 'show' | 'movie'.
+
+    function fetchHiddenProgressWatched() {
+        if (!hasToken()) return Promise.resolve([]);
+        return traktFetch('/users/hidden/progress_watched?type=show&limit=200')
+            .then(function (rows) {
+                if (!Array.isArray(rows)) return [];
+                return rows.map(function (r) {
+                    var s = r && r.show;
+                    if (!s || !s.ids) return null;
+                    return {
+                        tmdb:  s.ids.tmdb,
+                        trakt: s.ids.trakt,
+                        type:  'show',
+                        title: s.title,
+                        year:  s.year
+                    };
+                }).filter(Boolean);
+            })['catch'](function (err) {
+                warn('fetchHiddenProgressWatched failed',
+                    { status: err && err.status });
+                return [];
+            });
+    }
+
+    function fetchHiddenDropped() {
+        if (!hasToken()) return Promise.resolve([]);
+        return traktFetch('/users/hidden/dropped?type=show&limit=200')
+            .then(function (rows) {
+                if (!Array.isArray(rows)) return [];
+                return rows.map(function (r) {
+                    var s = r && r.show;
+                    if (!s || !s.ids) return null;
+                    return {
+                        tmdb:  s.ids.tmdb,
+                        trakt: s.ids.trakt,
+                        type:  'show',
+                        title: s.title,
+                        year:  s.year
+                    };
+                }).filter(Boolean);
+            })['catch'](function (err) {
+                warn('fetchHiddenDropped failed',
+                    { status: err && err.status });
+                return [];
+            });
+    }
+
+    function fetchThrownListItems(listId) {
+        if (!hasToken() || !listId) return Promise.resolve([]);
+        return traktFetch('/users/me/lists/' + listId + '/items?type=show,movie&limit=200')
+            .then(function (rows) {
+                if (!Array.isArray(rows)) return [];
+                return rows.map(function (r) {
+                    if (!r) return null;
+                    var t = r.type;
+                    var entity = (t === 'movie') ? r.movie : r.show;
+                    if (!entity || !entity.ids) return null;
+                    return {
+                        tmdb:  entity.ids.tmdb,
+                        trakt: entity.ids.trakt,
+                        type:  (t === 'movie') ? 'movie' : 'show',
+                        title: entity.title,
+                        year:  entity.year
+                    };
+                }).filter(Boolean);
+            })['catch'](function (err) {
+                warn('fetchThrownListItems failed',
+                    { listId: listId, status: err && err.status });
+                return [];
+            });
+    }
+
+    // Union трёх ячеек по tmdb id. Возвращает { union, sources }, где
+    //   union   = массив { tmdb, trakt, type, title, year } без дублей
+    //   sources = { tmdb → { hpw: bool, hdr: bool, list: bool } } — какая
+    //             ячейка содержит этот id. Используется для канонизации:
+    //             если id есть в одной ячейке но нет в двух других,
+    //             фоновой POST'ом дописываем недостающие.
+    function readThrownUnion() {
+        var listId = getThrownListId();
+        return Promise.all([
+            fetchHiddenProgressWatched(),
+            fetchHiddenDropped(),
+            fetchThrownListItems(listId)
+        ]).then(function (res) {
+            var hpw  = res[0];
+            var hdr  = res[1];
+            var list = res[2];
+
+            var byTmdb = {};
+            var sources = {};
+
+            function ingest(arr, key) {
+                arr.forEach(function (it) {
+                    if (!it.tmdb) return;
+                    var k = String(it.tmdb);
+                    if (!byTmdb[k]) byTmdb[k] = it;
+                    if (!sources[k]) sources[k] = { hpw: false, hdr: false, list: false };
+                    sources[k][key] = true;
+                });
+            }
+            ingest(hpw,  'hpw');
+            ingest(hdr,  'hdr');
+            ingest(list, 'list');
+
+            var union = Object.keys(byTmdb).map(function (k) { return byTmdb[k]; });
+            log('thrown union', {
+                hpw_count: hpw.length, hdr_count: hdr.length,
+                list_count: list.length, union_count: union.length
+            });
+            return { union: union, sources: sources };
+        });
+    }
+
+    // Write-канонизация: для каждой карточки в union, которая есть не во
+    // всех трёх ячейках, дописываем её в недостающие. Fire-and-forget,
+    // ошибки не валят основной поток. Запускается из syncStatusFolders
+    // после readThrownUnion. Канонизирует не наши действия, а действия
+    // других клиентов (Moviebase → пишет только в hpw, Trakt-веб → только
+    // в hdr): чтобы Lampa и любой следующий клиент получили полную картину.
+    function writeCanonizationThrown(union, sources) {
+        if (!union.length) return;
+        var listId = getThrownListId();
+        var pending = [];
+
+        union.forEach(function (it) {
+            var k = String(it.tmdb);
+            var src = sources[k] || {};
+            // Канонизируем только shows в hpw/hdr (movie hidden не поддерживает).
+            // В кастомный список — оба типа.
+            if (it.type === 'show') {
+                if (!src.hpw) pending.push({ kind: 'hpw_add', show: it });
+                if (!src.hdr) pending.push({ kind: 'hdr_add', show: it });
+            }
+            if (listId && !src.list) {
+                pending.push({ kind: 'list_add', listId: listId, item: it });
+            }
+        });
+
+        if (!pending.length) return;
+        log('thrown canonization', { plan: pending.length });
+
+        pending.forEach(function (op) {
+            if (op.kind === 'hpw_add') {
+                postHiddenAdd('progress_watched', { trakt: op.show.trakt, tmdb: op.show.tmdb }, 'show');
+            } else if (op.kind === 'hdr_add') {
+                postHiddenAdd('dropped', { trakt: op.show.trakt, tmdb: op.show.tmdb }, 'show');
+            } else if (op.kind === 'list_add') {
+                postListAdd(op.listId, { trakt: op.item.trakt, tmdb: op.item.tmdb }, op.item.type);
+            }
+        });
+    }
+
+    // Низкоуровневые POST'ы. body минимальный: ids.trakt если есть, иначе
+    // ids.tmdb. Trakt принимает оба варианта.
+    function buildHiddenBody(ids, type) {
+        var entry = { ids: {} };
+        if (ids.trakt) entry.ids.trakt = Number(ids.trakt);
+        if (ids.tmdb)  entry.ids.tmdb  = Number(ids.tmdb);
+        if (!entry.ids.trakt && !entry.ids.tmdb) return null;
+        return type === 'movie' ? { movies: [entry] } : { shows: [entry] };
+    }
+
+    function postHiddenAdd(section, ids, type) {
+        var body = buildHiddenBody(ids, type);
+        if (!body) return Promise.resolve(null);
+        return traktFetch('/users/hidden/' + section, { method: 'POST', body: body })
+            .then(function (resp) {
+                log('POST /users/hidden/' + section + ' ok',
+                    { ids: ids, added: resp && resp.added });
+                return resp;
+            })['catch'](function (err) {
+                warn('POST /users/hidden/' + section + ' failed',
+                    { ids: ids, status: err && err.status, response: err && err.response });
+                return null;
+            });
+    }
+
+    function postHiddenRemove(section, ids, type) {
+        var body = buildHiddenBody(ids, type);
+        if (!body) return Promise.resolve(null);
+        return traktFetch('/users/hidden/' + section + '/remove', { method: 'POST', body: body })
+            .then(function (resp) {
+                log('POST /users/hidden/' + section + '/remove ok',
+                    { ids: ids, deleted: resp && resp.deleted });
+                return resp;
+            })['catch'](function (err) {
+                warn('POST /users/hidden/' + section + '/remove failed',
+                    { ids: ids, status: err && err.status, response: err && err.response });
+                return null;
+            });
+    }
+
+    function postListAdd(listId, ids, type) {
+        var body = buildHiddenBody(ids, type);
+        if (!body || !listId) return Promise.resolve(null);
+        return traktFetch('/users/me/lists/' + listId + '/items', { method: 'POST', body: body })
+            .then(function (resp) {
+                log('POST list ' + listId + ' add ok',
+                    { ids: ids, type: type, added: resp && resp.added });
+                return resp;
+            })['catch'](function (err) {
+                warn('POST list ' + listId + ' add failed',
+                    { ids: ids, status: err && err.status, response: err && err.response });
+                return null;
+            });
+    }
+
+    function postListRemove(listId, ids, type) {
+        var body = buildHiddenBody(ids, type);
+        if (!body || !listId) return Promise.resolve(null);
+        return traktFetch('/users/me/lists/' + listId + '/items/remove', { method: 'POST', body: body })
+            .then(function (resp) {
+                log('POST list ' + listId + ' remove ok',
+                    { ids: ids, type: type, deleted: resp && resp.deleted });
+                return resp;
+            })['catch'](function (err) {
+                warn('POST list ' + listId + ' remove failed',
+                    { ids: ids, status: err && err.status, response: err && err.response });
+                return null;
+            });
+    }
+
+    // High-level write для пользовательского действия «положить в Брошено».
+    // Симметрично пишем все три ячейки + Pending Op (чтобы reconcile не
+    // успел откатить пока Trakt отдаёт stale-данные). Тип карточки резолвим
+    // через resolveCardType — тощие карточки от Lampa.Favorite не имеют
+    // method/card_type, см. v0.8.4.
+    function addThrown(card) {
+        if (!hasToken()) return;
+        var id = tmdbId(card);
+        if (!id) { warn('addThrown: нет tmdb id', card); return; }
+        if (checkWriteDedup('add', 'thrown', id)) return;
+
+        resolveCardType(card).then(function (type) {
+            var ids  = { tmdb: id };
+            var listId = getThrownListId();
+
+            if (type === 'show') {
+                postHiddenAdd('progress_watched', ids, 'show');
+                postHiddenAdd('dropped',          ids, 'show');
+            }
+            if (listId) {
+                postListAdd(listId, ids, type === 'movie' ? 'movie' : 'show');
+            } else {
+                log('addThrown: список Брошено не настроен — кастомный список не пишем',
+                    { id: id, type: type });
+            }
+
+            // Pending Op закрывает stale-окно Trakt. Без него reconcile
+            // в течение 5–15 мин может увидеть «карточка не в hpw/hdr/list»
+            // (потому что Trakt ещё не применил наши POST'ы) и убрать её
+            // из desired.thrown.
+            addPendingOp({
+                id:     id,
+                folder: 'thrown',
+                action: 'add',
+                type:   type === 'movie' ? 'movie' : 'show'
+            });
+        });
+    }
+
+    function removeThrown(card) {
+        if (!hasToken()) return;
+        var id = tmdbId(card);
+        if (!id) { warn('removeThrown: нет tmdb id', card); return; }
+        if (checkWriteDedup('remove', 'thrown', id)) return;
+
+        resolveCardType(card).then(function (type) {
+            var ids  = { tmdb: id };
+            var listId = getThrownListId();
+
+            if (type === 'show') {
+                postHiddenRemove('progress_watched', ids, 'show');
+                postHiddenRemove('dropped',          ids, 'show');
+            }
+            if (listId) {
+                postListRemove(listId, ids, type === 'movie' ? 'movie' : 'show');
+            }
+
+            addPendingOp({
+                id:     id,
+                folder: 'thrown',
+                action: 'remove',
+                type:   type === 'movie' ? 'movie' : 'show'
+            });
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -2117,25 +2488,46 @@
             warn('addSettings: addParam (pending_ttl) ошибка', e);
         }
 
+        // Селектор кастомного Trakt-списка для статуса Брошено. Список ID's
+        // подгружаются из /users/me/lists асинхронно при первом открытии
+        // настроек. Кеш в Storage даёт мгновенный начальный показ. Если
+        // сеть недоступна — селектор остаётся с тем, что в кеше (или с
+        // одной опцией «Не выбрано»). Юзер создаёт список вручную в UI
+        // Trakt; имя любое, идентификация по ids.trakt (стабильно при
+        // переименовании списка).
         try {
+            var values = { '0': 'Не выбрано' };
+            getCachedUserLists().forEach(function (l) {
+                values[String(l.id)] = l.name;
+            });
             Lampa.SettingsApi.addParam({
                 component: COMPONENT,
-                param: { name: 'trakt_folder_sync_diag_dump', type: 'trigger', 'default': false },
-                field: {
-                    name: 'Снять дамп Trakt (диагностика)',
-                    description: 'Read-only снимок ячеек Trakt в лог. Включи — снимется и галка сбросится. Для выяснения совместимости с Moviebase.'
+                param: {
+                    name:    STORAGE_THROWN_LIST_ID,
+                    type:    'select',
+                    values:  values,
+                    'default': '0'
                 },
-                onChange: function (val) {
-                    var on = (val === true || val === 'true' || val === 1 || val === '1');
-                    if (!on) return;
-                    try { Lampa.Storage.set('trakt_folder_sync_diag_dump', false); } catch (e) {}
-                    dumpTraktSnapshot();
+                field: {
+                    name: 'Папка Trakt для статуса Брошено',
+                    description: 'Кастомный список Trakt, в котором плагин дублирует статус «Брошено» для визуального маркера в Moviebase / Trakt-веб. Создай список руками в UI Trakt и выбери его здесь. Если «Не выбрано» — Брошено пишется только в hidden_progress_watched + hidden_dropped (без визуального маркера у других клиентов).'
                 }
             });
-            log('addSettings: ок');
         } catch (e) {
-            warn('addSettings: addParam (diag_dump) ошибка', e);
+            warn('addSettings: addParam (thrown_list) ошибка', e);
         }
+
+        // Асинхронная подгрузка свежего списка. При следующем открытии
+        // настроек кеш обновится, и values селектора покажут актуальные
+        // имена. В рамках текущего открытия настроек values не перерисуем —
+        // Lampa.SettingsApi не даёт API на «обновить опции селектора».
+        if (hasToken()) {
+            fetchUserLists().then(function (lists) {
+                log('fetchUserLists', { count: lists.length });
+            });
+        }
+
+        log('addSettings: ок');
     }
 
     // -----------------------------------------------------------------------
