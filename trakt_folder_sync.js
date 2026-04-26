@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.9.2';
+    var VERSION         = '0.9.3';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // Папки Lampa, которые плагин read/write-ит к Trakt. По ним строится
@@ -1522,19 +1522,28 @@
     var EPISODE_SYNC_PENDING_TTL_MS = 60 * 1000;
     var _syncingEpisodes = false;
     var _episodeHashIndex = {};   // hash → { tmdb, season, episode, name }
-    // Две независимые защиты — путать нельзя (rc1 → rc2 фикс):
-    //   _selfWriteMark[h]    — мы (плагин) только что записали Timeline.update
-    //                          для этого hash. Listener percent=0 после такой
-    //                          записи трактуем как echo, не как user-unmark.
-    //   _pendingLampaMark[h] — user только что отметил серию в Lampa
-    //                          (listener percent≥threshold). Используется
-    //                          ТОЛЬКО в reconcile (syncEpisodesForShow), чтобы
-    //                          не снять отметку до того, как chuck-плагин
-    //                          допишет её в Trakt. В самом listener percent=0
-    //                          этот флаг НЕ читаем, иначе блокирует ровно тот
-    //                          сценарий, который должны поймать (rc1 bug).
-    var _selfWriteMark    = {};
-    var _pendingLampaMark = {};
+    // Три независимые защиты — путать нельзя (rc1 → rc2 фикс):
+    //   _selfWriteMark[h]      — мы (плагин) только что записали Timeline.update
+    //                            для этого hash. Listener percent=0 после такой
+    //                            записи трактуем как echo, не как user-unmark.
+    //   _pendingLampaMark[h]   — user только что отметил серию в Lampa
+    //                            (listener percent≥threshold). Используется
+    //                            ТОЛЬКО в reconcile (syncEpisodesForShow), чтобы
+    //                            не снять отметку до того, как chuck-плагин
+    //                            допишет её в Trakt. В самом listener percent=0
+    //                            этот флаг НЕ читаем, иначе блокирует ровно тот
+    //                            сценарий, который должны поймать (rc1 bug).
+    //   _pendingLampaUnmark[h] — симметрично _pendingLampaMark: user только
+    //                            что снял серию в Lampa (listener percent=0,
+    //                            не self-write). До того как Trakt применит
+    //                            наш /sync/history/remove (stale-окно 5–15
+    //                            мин), reconcile видит «Trakt✓ / Lampa✗» и
+    //                            может перепометить серию. Флаг защищает
+    //                            ручное снятие от переотметки. Используется
+    //                            ТОЛЬКО в reconcile (0.9.3).
+    var _selfWriteMark      = {};
+    var _pendingLampaMark   = {};
+    var _pendingLampaUnmark = {};
 
     // Hash как считает Lampa.Timeline.watchedEpisode:
     //   Utils.hash([season, season>10?':':'', episode, original_name].join(''))
@@ -1633,6 +1642,15 @@
         }
         return true;
     }
+    function isPendingLampaUnmark(hash) {
+        var ts = _pendingLampaUnmark[hash];
+        if (!ts) return false;
+        if (Date.now() - ts > EPISODE_SYNC_PENDING_TTL_MS) {
+            delete _pendingLampaUnmark[hash];
+            return false;
+        }
+        return true;
+    }
     function isSelfWriteMark(hash) {
         var ts = _selfWriteMark[hash];
         if (!ts) return false;
@@ -1715,6 +1733,12 @@
                     });
                 }
                 if (traktWatched && !lampaWatched) {
+                    // 0.9.3: если user только что снял серию в Lampa — не
+                    // переотмечаем (Trakt ещё не успел применить remove).
+                    if (h && isPendingLampaUnmark(h)) {
+                        pendingSkipped++;
+                        return;
+                    }
                     if (markEpisodeInLampa(snum, enum_, name)) added++;
                 } else if (!traktWatched && lampaWatched) {
                     if (h && isPendingLampaMark(h)) {
@@ -1869,6 +1893,11 @@
                     log('Timeline percent=0 — echo от self-write, игнор', { hash: hash });
                     return;
                 }
+                // 0.9.3: симметрично _pendingLampaMark. Trakt не сразу
+                // применит /sync/history/remove (stale 5–15 мин), reconcile
+                // в это окно увидит Trakt✓/Lampa✗ и перепометит серию —
+                // даём ему сигнал «не трогать».
+                _pendingLampaUnmark[hash] = Date.now();
                 handleLampaUnmark(hash);
             }
             // Иные значения (1..89) — playback-progress, нас не интересует
