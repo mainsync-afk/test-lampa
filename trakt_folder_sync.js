@@ -8,12 +8,14 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.10.0';
+    var VERSION         = '0.10.1';
 
     var SYNC_TAG        = 'TraktFolderSync';
-    // С 0.10.0: thrown ↔ Trakt /users/hidden/dropped. Брошенный сериал
-    // должен лежать ровно в одной из этих папок — enforceStatusExclusivity
-    // и verifyStatusFoldersClean уже параметрические по STATUS_FOLDERS.
+    // С 0.10.1: thrown ↔ Trakt /users/hidden/progress_watched (legacy-секция,
+    // даёт «серая карточка + Restore» в Trakt CW; см. postDropped).
+    // Брошенный сериал должен лежать ровно в одной из этих папок —
+    // enforceStatusExclusivity и verifyStatusFoldersClean уже параметрические
+    // по STATUS_FOLDERS.
     // У Lampa MARK-набор по факту шире (есть ещё scheduled), но в Trakt
     // прямого аналога scheduled нет — оставляем без синхронизации.
     var STATUS_FOLDERS  = ['look', 'viewed', 'continued', 'thrown'];
@@ -698,19 +700,26 @@
         });
     }
 
-    // Список «брошенных» (Drop Show) сериалов из Trakt.
-    // GET /users/hidden/dropped?type=show.
+    // Список «брошенных» сериалов из Trakt.
+    // GET /users/hidden/progress_watched?type=show.
     //
-    // Trakt'овская фича Drop (анонс март 2025) — родной аналог Lampa'шной
-    // папки «Брошено» (thrown). Watched-история сериала при drop'е сохраняется
-    // (это свойство самого эндпоинта), но он скрыт из Up Next / Progress /
-    // Calendar; в нашей классификации выводим из look/viewed/continued и
-    // кладём только в thrown.
+    // Trakt-эндпоинтов hidden несколько; разница в визуальном эффекте в Trakt UI:
+    //   • /users/hidden/dropped — новая фича (анонс март 2025, «Drop Show»).
+    //     Полностью убирает сериал из CW / Progress / Up Next / Calendar.
+    //     В Trakt UI карточка просто исчезает с CW. Это то, что делает
+    //     кнопка «Drop Show» в самом Trakt UI.
+    //   • /users/hidden/progress_watched — старая, легаси, «Hide from Progress».
+    //     В Trakt UI карточка остаётся в CW, но рисуется серой с кнопкой Restore.
+    //     Этот эффект пользователь видел при «Stop Watching» в Moviebase —
+    //     Moviebase, вероятно, шлёт именно сюда. История просмотров не теряется.
+    //
+    // С 0.10.1 переключились на progress_watched как более близкий к ожидаемому
+    // поведению (карточка не исчезает из Trakt CW, а помечается серой).
     //
     // limit=500: дефолт у Trakt = 10, на форуме сообщали о потере данных при
     // больших списках. С запасом достаточно для типичного пользователя.
     function fetchDroppedShows() {
-        return traktFetch('/users/hidden/dropped?type=show&limit=500')
+        return traktFetch('/users/hidden/progress_watched?type=show&limit=500')
             .then(function (items) {
                 if (!Array.isArray(items)) return [];
                 var rows = [];
@@ -1502,17 +1511,22 @@
         });
     }
 
-    // POST /users/hidden/dropped (drop) или /users/hidden/dropped/remove (restore).
+    // POST /users/hidden/progress_watched (drop) или
+    // /users/hidden/progress_watched/remove (restore).
     // Body: { shows: [{ ids: { tmdb: ... } }] }. Trakt сам резолвит TMDB.
-    // История просмотров на Trakt сохраняется — это свойство фичи Drop.
     //
-    // Если пользователь руками вернёт карточку из thrown (Lampa.Favorite.remove),
-    // мы посылаем restore: сериал снова виден в Up Next / Progress / Calendar.
+    // Используем legacy-секцию progress_watched, а не новую dropped (март 2025):
+    // dropped полностью прячет сериал из Trakt-интерфейса, а progress_watched
+    // оставляет карточку в Continue Watching, делает её серой и показывает
+    // кнопку Restore. Это тот эффект, который дёргает Moviebase кнопкой
+    // Stop Watching и который пользователь хочет повторить.
+    //
+    // История просмотров на Trakt сохраняется в обоих режимах.
     function postDropped(action, id) {
         var body = { shows: [{ ids: { tmdb: Number(id) } }] };
         var path = action === 'remove'
-            ? '/users/hidden/dropped/remove'
-            : '/users/hidden/dropped';
+            ? '/users/hidden/progress_watched/remove'
+            : '/users/hidden/progress_watched';
         return traktFetch(path, { method: 'POST', body: body })
             .then(function (resp) {
                 log('dropped ' + action + ' ok', { id: id, resp: resp });
