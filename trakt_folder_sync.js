@@ -8,28 +8,10 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.11.2';
+    var VERSION         = '0.9.1';
 
     var SYNC_TAG        = 'TraktFolderSync';
-    // С 0.11.0: thrown ↔ персональный Trakt user list «Брошено».
-    // Это «значок папки на постере» в Trakt/Moviebase + поддержка фильмов
-    // (hidden/dropped и hidden/progress_watched были shows-only).
-    // Параллельно при add/remove дёргаем /users/hidden/dropped как helper
-    // для очистки CW в Trakt — чтобы брошенный сериал не торчал в Up Next
-    // (помощник касается только сериалов, фильмам в CW делать нечего).
-    // Истории просмотров и watched-state не трогаем — лист их не трогает,
-    // hidden/dropped тоже сохраняет.
-    //
-    // Брошенный сериал должен лежать ровно в одной из STATUS_FOLDERS —
-    // enforceStatusExclusivity и verifyStatusFoldersClean уже параметрические.
-    // У Lampa MARK-набор по факту шире (есть ещё scheduled), но в Trakt
-    // прямого аналога scheduled нет — оставляем без синхронизации.
-    var STATUS_FOLDERS  = ['look', 'viewed', 'continued', 'thrown'];
-
-    // Имя кастомного листа в Trakt. Создаём при первом write, если такого
-    // ещё нет. Slug кешируется в Lampa.Storage чтобы не ходить в /users/me/lists
-    // на каждый цикл.
-    var THROWN_LIST_NAME = 'Брошено';
+    var STATUS_FOLDERS  = ['look', 'viewed', 'continued'];
     // Не создаём свой компонент — подмешиваем параметры в уже существующий
     // раздел «Trakt» от плагина trakt_by_lampame / trakttv. В v0.4.0–0.4.1
     // пробовали свой component: 'trakt_folder_sync' — Lampa регистрировала
@@ -39,7 +21,6 @@
     var STORAGE_LOGGING     = 'trakt_enable_logging';
     var STORAGE_PENDING     = 'trakt_folder_sync_pending';
     var STORAGE_PENDING_TTL = 'trakt_folder_sync_pending_ttl';
-    var STORAGE_THROWN_LIST = 'trakt_folder_sync_thrown_list_slug';
 
     // Базовый URL — тот же прокси, что использует trakt_by_lampame. Прокси
     // подставляет trakt-api-key на сервере, поэтому прямой api.trakt.tv без
@@ -712,173 +693,18 @@
         });
     }
 
-    // -----------------------------------------------------------------------
-    // Кастомный Trakt user list «Брошено» (v0.11.0)
-    // -----------------------------------------------------------------------
-    //
-    // Почему лист, а не hidden-секции:
-    //   • lists поддерживают и фильмы, и сериалы (hidden/dropped и
-    //     hidden/progress_watched — shows-only).
-    //   • в Trakt-поиске и Moviebase карточка из листа получает значок папки
-    //     на постере — это видимый сигнал «брошено» вне CW.
-    //   • листом владеем мы: hidden-секции зашумлены чужими интеграциями.
-    //
-    // Для очистки CW параллельно с записью в лист зовём
-    // /users/hidden/dropped — это helper-эндпоинт, не источник правды.
-    // Он касается только сериалов; фильмам в CW делать нечего.
-    //
-    // Slug листа кешируется в Lampa.Storage чтобы не ходить за списком
-    // листов на каждый цикл.
-
-    // Валидный slug — непустая строка, не «undefined»/«null» (storage Lampa
-    // умеет записывать undefined как одноимённую строку — лог 0.11.0 показал,
-    // что после неудачного create это нагадило в кеш и каждый запрос потом
-    // шёл на /users/me/lists/undefined/items с 404).
-    function isValidSlug(s) {
-        return typeof s === 'string'
-            && s.length > 0
-            && s !== 'undefined'
-            && s !== 'null';
-    }
-
-    function saveThrownListSlug(slug) {
-        if (!isValidSlug(slug)) {
-            warn('saveThrownListSlug: пустой/мусорный slug, не сохраняем',
-                { slug: slug });
-            return null;
-        }
-        Lampa.Storage.set(STORAGE_THROWN_LIST, slug);
-        return slug;
-    }
-
-    function clearThrownListCache(reason) {
-        log('thrown list cache: сброс', { reason: reason });
-        // Lampa.Storage не умеет удалять ключ — пишем пустую строку,
-        // isValidSlug её отвергнет и getThrownListSlug пойдёт в findOrCreate.
-        Lampa.Storage.set(STORAGE_THROWN_LIST, '');
-    }
-
-    function getThrownListSlug() {
-        var cached = Lampa.Storage.field(STORAGE_THROWN_LIST);
-        if (isValidSlug(cached)) {
-            return Promise.resolve(cached);
-        }
-        if (cached) {
-            // в кеше что-то невалидное лежит — чистим, чтобы заново не
-            // считаться валидным truthy
-            clearThrownListCache('invalid cached value: ' + JSON.stringify(cached));
-        }
-        return findOrCreateThrownList();
-    }
-
-    function findOrCreateThrownList() {
-        return traktFetch('/users/me/lists').then(function (lists) {
-            log('thrown list: GET /users/me/lists', {
-                count: Array.isArray(lists) ? lists.length : 'not-array',
-                names: Array.isArray(lists)
-                    ? lists.map(function (l) { return l && l.name; })
-                    : null
-            });
-            if (Array.isArray(lists)) {
-                for (var i = 0; i < lists.length; i++) {
-                    var l = lists[i];
-                    if (l && l.name === THROWN_LIST_NAME && l.ids && isValidSlug(l.ids.slug)) {
-                        saveThrownListSlug(l.ids.slug);
-                        log('thrown list найден', { slug: l.ids.slug });
-                        return l.ids.slug;
-                    }
-                }
-            }
-            return createThrownList();
-        });
-    }
-
-    function createThrownList() {
-        var body = {
-            name:             THROWN_LIST_NAME,
-            description:      'Brosheno — синхронизация из Lampa (trakt_folder_sync)',
-            privacy:          'private',
-            display_numbers:  false,
-            allow_comments:   false,
-            sort_by:          'rank',
-            sort_how:         'asc'
-        };
-        log('thrown list: POST /users/me/lists', { body: body });
-        return traktFetch('/users/me/lists', { method: 'POST', body: body })
-            .then(function (created) {
-                log('thrown list: POST ответ', { created: created });
-                var slug = created && created.ids && created.ids.slug;
-                if (!isValidSlug(slug)) {
-                    throw new Error(
-                        'createThrownList: ответ Trakt без валидного slug — ' +
-                        JSON.stringify(created)
-                    );
-                }
-                saveThrownListSlug(slug);
-                log('thrown list создан', { slug: slug });
-                return slug;
-            });
-    }
-
-    // GET /users/me/lists/:slug/items.
-    // Возвращает массив записей с type='show'|'movie' — резолвим обе ветки,
-    // чтобы computeStatusFolders мог положить в desired.thrown оба типа.
-    //
-    // На 404 чистим кеш slug: значит лист удалён или slug в кеше
-    // протух. Следующий цикл вызовет findOrCreateThrownList и пересоздаст.
-    function fetchThrownListItems() {
-        return getThrownListSlug()
-            .then(function (slug) {
-                return traktFetch('/users/me/lists/' + slug + '/items?limit=500');
-            })
-            .then(function (items) {
-                if (!Array.isArray(items)) return [];
-                var rows = [];
-                items.forEach(function (it) {
-                    if (!it) return;
-                    var entity = it.show || it.movie;
-                    if (!entity || !entity.ids || !entity.ids.tmdb) return;
-                    rows.push({
-                        id:    String(entity.ids.tmdb),
-                        ids:   entity.ids,
-                        type:  it.type === 'movie' ? 'movie' : 'show',
-                        title: entity.title || '',
-                        year:  entity.year
-                    });
-                });
-                return rows;
-            })['catch'](function (err) {
-                if (err && err.status === 404) {
-                    clearThrownListCache('GET items 404');
-                }
-                warn('fetchThrownListItems failed', {
-                    status:  err && err.status,
-                    message: err && err.message
-                });
-                return [];
-            });
-    }
-
     // Накладываем pending ops на желаемое распределение по статусным папкам.
     //
     // Семантика:
     // • pending add в папку X → карточка должна быть ТОЛЬКО в X (убираем
     //   id из остальных статусных папок desired; если X не содержит id —
     //   вставляем минимальный stub, чтобы sync не удалил локальную копию).
-    // • pending remove из папки X → убираем id ТОЛЬКО из desired[X].
-    //   Если для того же id есть pending add в другую папку — он положит
-    //   карточку куда надо; если add'а нет — карточка просто исчезает из
-    //   X и в других статусных папках её и так нет (Trakt мог её туда
-    //   ещё не положить).
+    // • pending remove из любой статусной папки → убираем id из всех
+    //   статусных папок desired (карточка не должна нигде появиться).
     //
-    // 0.11.2: до этого remove чистил все STATUS_FOLDERS — и при перетаскивании
-    // look→thrown пара pending ops (thrown=add + look=remove) друг друга
-    // гасила: add клал в thrown, последующий remove чистил всё включая thrown,
-    // и сериал в следующий цикл уезжал «вникуда».
-    //
-    // Причина существования pending ops: Trakt отдаёт устаревшее состояние
-    // 5–15 минут после записи, и без этого классификатор положил бы сериал
-    // обратно в ту папку, из которой пользователь только что увёл.
+    // Причина: Trakt отдаёт устаревшее состояние 5–15 минут после записи,
+    // и без этого классификатор положил бы сериал обратно в ту папку, из
+    // которой пользователь только что увёл.
     function applyStatusPendingOps(desired) {
         var pending = loadPendingOps().filter(function (op) {
             return STATUS_FOLDERS.indexOf(op.folder) >= 0;
@@ -910,8 +736,10 @@
             }
 
             if (op.action === 'remove') {
-                desired[op.folder] = desired[op.folder].filter(function (c) {
-                    return String(c.id) !== id;
+                STATUS_FOLDERS.forEach(function (f) {
+                    desired[f] = desired[f].filter(function (c) {
+                        return String(c.id) !== id;
+                    });
                 });
             }
         });
@@ -920,92 +748,39 @@
     }
 
     function computeStatusFolders() {
-        return Promise.all([
-            fetchShowsClassification(),
-            fetchWatchedMovies(),
-            fetchThrownListItems()
-        ]).then(function (results) {
-            var shows  = results[0];
-            var movies = results[1];
-            var thrown = results[2];
+        return Promise.all([fetchShowsClassification(), fetchWatchedMovies()])
+            .then(function (results) {
+                var shows  = results[0];
+                var movies = results[1];
 
-            // Лист «Брошено» — источник правды для thrown. Если карточка
-            // (фильм или сериал) есть в листе, она идёт в desired.thrown
-            // и НЕ дублируется в look/viewed/continued. Watched-история
-            // и watchlist-статусы при этом не трогаются — лист их не знает.
-            var thrownById = {};
-            thrown.forEach(function (t) { thrownById[t.id] = t; });
+                var desired = { look: [], viewed: [], continued: [] };
 
-            var desired = { look: [], viewed: [], continued: [], thrown: [] };
-
-            shows.forEach(function (row) {
-                if (thrownById[row.id]) {
-                    var t = thrownById[row.id];
-                    desired.thrown.push({
+                shows.forEach(function (row) {
+                    desired[row.folder].push({
                         id:        row.id,
                         ids:       row.ids,
-                        title:     t.title || row.title,
-                        year:      t.year || row.year,
+                        title:     row.title,
+                        year:      row.year,
                         method:    'tv',
                         card_type: 'tv'
                     });
-                    delete thrownById[row.id];
-                    return;
-                }
-                desired[row.folder].push({
-                    id:        row.id,
-                    ids:       row.ids,
-                    title:     row.title,
-                    year:      row.year,
-                    method:    'tv',
-                    card_type: 'tv'
                 });
-            });
 
-            movies.forEach(function (m) {
-                if (thrownById[m.id]) {
-                    var t = thrownById[m.id];
-                    desired.thrown.push({
+                movies.forEach(function (m) {
+                    desired.viewed.push({
                         id:        m.id,
                         ids:       m.ids,
-                        title:     t.title || m.title,
-                        year:      t.year || m.year,
+                        title:     m.title,
+                        year:      m.year,
                         method:    'movie',
                         card_type: 'movie'
                     });
-                    delete thrownById[m.id];
-                    return;
-                }
-                desired.viewed.push({
-                    id:        m.id,
-                    ids:       m.ids,
-                    title:     m.title,
-                    year:      m.year,
-                    method:    'movie',
-                    card_type: 'movie'
                 });
+
+                applyStatusPendingOps(desired);
+
+                return desired;
             });
-
-            // Карточки из листа без watched-истории — добавляем «как есть»
-            // (например, фильм, который пользователь пометил «брошено», не
-            // начав смотреть, или сериал без отмеченных эпизодов).
-            Object.keys(thrownById).forEach(function (id) {
-                var t = thrownById[id];
-                var isMovie = t.type === 'movie';
-                desired.thrown.push({
-                    id:        t.id,
-                    ids:       t.ids,
-                    title:     t.title,
-                    year:      t.year,
-                    method:    isMovie ? 'movie' : 'tv',
-                    card_type: isMovie ? 'movie' : 'tv'
-                });
-            });
-
-            applyStatusPendingOps(desired);
-
-            return desired;
-        });
     }
 
     function syncStatusFolder(folder, desiredList) {
@@ -1278,15 +1053,14 @@
             log('статусы рассчитаны', {
                 look:      desired.look.length,
                 viewed:    desired.viewed.length,
-                continued: desired.continued.length,
-                thrown:    desired.thrown.length
+                continued: desired.continued.length
             });
             // Диагностика: выводим названия и trakt-id, чтобы можно было
             // сверить с тем, что реально лежит в Trakt-аккаунте. Если тут
             // появляются карточки, которых в Trakt-вебе нет, значит токен
             // привязан к другому аккаунту или в Trakt есть рассинхрон
             // между /sync/watched и UI-страницей History.
-            STATUS_FOLDERS.forEach(function (f) {
+            ['look', 'viewed', 'continued'].forEach(function (f) {
                 if (!desired[f].length) return;
                 log('папка ' + f + ': классифицировано', desired[f].map(function (s) {
                     return {
@@ -1305,8 +1079,7 @@
             return Promise.all([
                 syncStatusFolder('look',      desired.look),
                 syncStatusFolder('viewed',    desired.viewed),
-                syncStatusFolder('continued', desired.continued),
-                syncStatusFolder('thrown',    desired.thrown)
+                syncStatusFolder('continued', desired.continued)
             ]).then(function (res) {
                 // Финальная страховка: если что-то осталось грязным после
                 // параллельных Promise — добиваем здесь.
@@ -1646,105 +1419,11 @@
         });
     }
 
-    // Запись действия пользователя в Trakt user list «Брошено».
-    //   • action='add': POST /users/me/lists/:slug/items
-    //   • action='remove': POST /users/me/lists/:slug/items/remove
-    // Body: { shows|movies: [{ ids: { tmdb: ... } }] }.
-    //
-    // Параллельно для сериалов дёргаем /users/hidden/dropped — чтобы
-    // карточка ушла из Trakt CW (для фильма helper не нужен, фильмы в CW
-    // не висят).
-    function postThrownItem(action, id, type) {
-        var idNum = Number(id);
-        var listBody = type === 'movie'
-            ? { movies: [{ ids: { tmdb: idNum } }] }
-            : { shows:  [{ ids: { tmdb: idNum } }] };
-
-        var listP = getThrownListSlug()
-            .then(function (slug) {
-                var path = action === 'remove'
-                    ? '/users/me/lists/' + slug + '/items/remove'
-                    : '/users/me/lists/' + slug + '/items';
-                return traktFetch(path, { method: 'POST', body: listBody })
-                    ['catch'](function (err) {
-                        // 404 = slug в кеше уже не существует в Trakt
-                        // (лист удалили). Сбрасываем кеш — следующий цикл
-                        // вызовет findOrCreate и пересоздаст.
-                        if (err && err.status === 404) {
-                            clearThrownListCache('list write 404');
-                        }
-                        throw err;
-                    });
-            });
-
-        // helper для CW — только сериалы.
-        var dropP = Promise.resolve(null);
-        if (type === 'show') {
-            var dropPath = action === 'remove'
-                ? '/users/hidden/dropped/remove'
-                : '/users/hidden/dropped';
-            var dropBody = { shows: [{ ids: { tmdb: idNum } }] };
-            dropP = traktFetch(dropPath, { method: 'POST', body: dropBody })
-                ['catch'](function (err) {
-                    // helper не критичен: основной эффект даёт лист.
-                    warn('thrown drop helper failed (ok, не критично)', {
-                        id: id, status: err && err.status
-                    });
-                    return null;
-                });
-        }
-
-        // Pending op кладём НЕЗАВИСИМО от успеха записи в Trakt.
-        //
-        // Зачем: если лист недоступен (slug undefined / прокси не пускает
-        // POST /users/me/lists / нет интернета), на следующем sync
-        // fetchThrownListItems вернёт пустой массив, desired.thrown=0, и
-        // syncStatusFolder('thrown') удалит локальную карточку — пользователь
-        // увидит «положил, потом исчезла». Pending op в Lampa.Storage держит
-        // карточку в desired.thrown пока действует TTL, давая шанс плагину
-        // докричаться до Trakt в следующем цикле.
-        //
-        // Если запись прошла — pending op просто продублирует то, что уже
-        // в Trakt. Если не прошла — даст безопасное окно для recover.
-        addPendingOp({
-            id: id, type: type, folder: 'thrown', action: action
-        });
-
-        return Promise.all([listP, dropP])
-            .then(function (results) {
-                log('thrown ' + action + ' ok', {
-                    id: id, type: type,
-                    list: results[0], drop: results[1]
-                });
-            })['catch'](function (err) {
-                warn('thrown ' + action + ' failed (pending op сохранён, повторим на следующем sync)', {
-                    id: id, type: type,
-                    status: err && err.status, response: err && err.response
-                });
-            });
-    }
-
     function pushHistory(folder, action, card) {
         if (!hasToken()) return;
         var id = tmdbId(card);
         if (!id) { warn('pushHistory: нет tmdb id', card); return; }
         if (checkWriteDedup(action, folder, id)) return;
-
-        if (folder === 'thrown') {
-            // С 0.11.0 thrown — это кастомный Trakt user list, который
-            // поддерживает оба типа. Тип всё равно резолвим через Trakt
-            // (а не по полям карточки), потому что в листенер Lampa часто
-            // приходит тощая карточка без method/card_type — см. 0.5.2/0.8.1.
-            // Если резолв не удался (нет интернета и т.п.) — пишем как
-            // сериал (старое предположение по умолчанию), это безопаснее
-            // фильма: для сериала ещё дёрнется helper /users/hidden/dropped,
-            // и в худшем случае Trakt вернёт 404 — лист всё равно примет.
-            resolveCardType(card).then(function (type) {
-                var t = (type === 'movie') ? 'movie' : 'show';
-                postThrownItem(action, id, t);
-            });
-            return;
-        }
 
         if (folder === 'continued') {
             // continued — производная «догнан + выходит». Пользователь
@@ -2300,7 +1979,7 @@
                 param: { name: STORAGE_ENABLED, type: 'trigger', 'default': true },
                 field: {
                     name: 'Синхронизация папок с Trakt (v' + VERSION + ')',
-                    description: 'Закладки, Смотрю, Просмотрено, Продолжение следует, Брошено — отражают состояние Trakt'
+                    description: 'Закладки, Смотрю, Просмотрено, Продолжение следует — отражают состояние Trakt'
                 }
             });
         } catch (e) {
