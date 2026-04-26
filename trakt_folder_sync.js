@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.10.0-rc1';
+    var VERSION         = '0.10.0-rc2';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // Папки Lampa, которые плагин read/write-ит к Trakt. По ним строится
@@ -1739,6 +1739,33 @@
         });
     }
 
+    // Дроссель канонизации: Trakt API в stale-окне 5–15 мин не сразу
+    // отражает наши POST'ы в GET'ах. Без памяти о недавно канонизированных
+    // парах (id, cell) каждый reconcile в этом окне переотправлял те же
+    // POST'ы (видим в логе lampa.mx-1777214349103: 14 POST hidden/dropped
+    // за один reconcile, и они повторятся при следующем открытии Избранного,
+    // пока Trakt не подтянет состояние). Trakt отвечает 201, но ничего не
+    // меняется (already exists), плюс шум в логе.
+    //
+    // Ключ — `<cell>:<tmdb>`. TTL = 15 мин (с запасом покрывает stale-окно).
+    var _recentCanonization = {};
+    var CANONIZATION_TTL_MS = 15 * 60 * 1000;
+
+    function recentlyCanonized(cell, tmdb) {
+        var key = cell + ':' + String(tmdb);
+        var ts  = _recentCanonization[key];
+        if (!ts) return false;
+        if (Date.now() - ts > CANONIZATION_TTL_MS) {
+            delete _recentCanonization[key];
+            return false;
+        }
+        return true;
+    }
+
+    function markCanonized(cell, tmdb) {
+        _recentCanonization[cell + ':' + String(tmdb)] = Date.now();
+    }
+
     // Write-канонизация: для каждой карточки в union, которая есть не во
     // всех трёх ячейках, дописываем её в недостающие. Fire-and-forget,
     // ошибки не валят основной поток. Запускается из syncStatusFolders
@@ -1756,10 +1783,14 @@
             // Канонизируем только shows в hpw/hdr (movie hidden не поддерживает).
             // В кастомный список — оба типа.
             if (it.type === 'show') {
-                if (!src.hpw) pending.push({ kind: 'hpw_add', show: it });
-                if (!src.hdr) pending.push({ kind: 'hdr_add', show: it });
+                if (!src.hpw && !recentlyCanonized('hpw', it.tmdb)) {
+                    pending.push({ kind: 'hpw_add', show: it });
+                }
+                if (!src.hdr && !recentlyCanonized('hdr', it.tmdb)) {
+                    pending.push({ kind: 'hdr_add', show: it });
+                }
             }
-            if (listId && !src.list) {
+            if (listId && !src.list && !recentlyCanonized('list', it.tmdb)) {
                 pending.push({ kind: 'list_add', listId: listId, item: it });
             }
         });
@@ -1769,10 +1800,13 @@
 
         pending.forEach(function (op) {
             if (op.kind === 'hpw_add') {
+                markCanonized('hpw', op.show.tmdb);
                 postHiddenAdd('progress_watched', { trakt: op.show.trakt, tmdb: op.show.tmdb }, 'show');
             } else if (op.kind === 'hdr_add') {
+                markCanonized('hdr', op.show.tmdb);
                 postHiddenAdd('dropped', { trakt: op.show.trakt, tmdb: op.show.tmdb }, 'show');
             } else if (op.kind === 'list_add') {
+                markCanonized('list', op.item.tmdb);
                 postListAdd(op.listId, { trakt: op.item.trakt, tmdb: op.item.tmdb }, op.item.type);
             }
         });
@@ -2454,7 +2488,8 @@
                 component: COMPONENT,
                 param: { name: STORAGE_ENABLED, type: 'trigger', 'default': true },
                 field: {
-                    description: 'Закладки, Смотрю, Просмотрено, Продолжение следует — отражают состояние Trakt'
+                    name: 'Синхронизация папок с Trakt (v' + VERSION + ')',
+                    description: 'Закладки, Смотрю, Просмотрено, Продолжение следует, Брошено — отражают состояние Trakt'
                 }
             });
         } catch (e) {
