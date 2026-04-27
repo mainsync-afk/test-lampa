@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.10.0-rc3';
+    var VERSION         = '0.10.0-rc4-diag';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // Папки Lampa, которые плагин read/write-ит к Trakt. По ним строится
@@ -1735,6 +1735,20 @@
                 hpw_count: hpw.length, hdr_count: hdr.length,
                 list_count: list.length, union_count: union.length
             });
+            // rc4-diag: показываем по каждой карточке в каких ячейках лежит,
+            // чтобы при hdr_count < union_count было видно, какой именно tmdb
+            // не сохраняется в /users/hidden/dropped.
+            log('thrown union details', union.map(function (it) {
+                var s = sources[String(it.tmdb)] || {};
+                return {
+                    tmdb:  it.tmdb,
+                    trakt: it.trakt,
+                    title: it.title,
+                    hpw:   !!s.hpw,
+                    hdr:   !!s.hdr,
+                    list:  !!s.list
+                };
+            }));
             return { union: union, sources: sources };
         });
     }
@@ -1797,6 +1811,26 @@
 
         if (!pending.length) return;
         log('thrown canonization', { plan: pending.length });
+        // rc4-diag: разворачиваем плановые операции, чтобы видеть какая
+        // карточка идёт куда — иначе по одному «plan: 4» не понять, что
+        // именно не доехало до hdr.
+        log('thrown canonization items', pending.map(function (op) {
+            if (op.kind === 'list_add') {
+                return {
+                    kind:  op.kind,
+                    tmdb:  op.item.tmdb,
+                    trakt: op.item.trakt,
+                    type:  op.item.type,
+                    title: op.item.title
+                };
+            }
+            return {
+                kind:  op.kind,
+                tmdb:  op.show.tmdb,
+                trakt: op.show.trakt,
+                title: op.show.title
+            };
+        }));
 
         pending.forEach(function (op) {
             if (op.kind === 'hpw_add') {
@@ -1827,8 +1861,12 @@
         if (!body) return Promise.resolve(null);
         return traktFetch('/users/hidden/' + section, { method: 'POST', body: body })
             .then(function (resp) {
+                // rc4-diag: показываем full added/not_found, чтобы увидеть,
+                // принял ли Trakt запись или отверг тихо (added.shows: 0).
                 log('POST /users/hidden/' + section + ' ok',
-                    { ids: ids, added: resp && resp.added });
+                    { ids: ids, body: body,
+                      added: resp && resp.added,
+                      not_found: resp && resp.not_found });
                 return resp;
             })['catch'](function (err) {
                 warn('POST /users/hidden/' + section + ' failed',
@@ -1843,7 +1881,9 @@
         return traktFetch('/users/hidden/' + section + '/remove', { method: 'POST', body: body })
             .then(function (resp) {
                 log('POST /users/hidden/' + section + '/remove ok',
-                    { ids: ids, deleted: resp && resp.deleted });
+                    { ids: ids, body: body,
+                      deleted: resp && resp.deleted,
+                      not_found: resp && resp.not_found });
                 return resp;
             })['catch'](function (err) {
                 warn('POST /users/hidden/' + section + '/remove failed',
@@ -1858,7 +1898,10 @@
         return traktFetch('/users/me/lists/' + listId + '/items', { method: 'POST', body: body })
             .then(function (resp) {
                 log('POST list ' + listId + ' add ok',
-                    { ids: ids, type: type, added: resp && resp.added });
+                    { ids: ids, type: type, body: body,
+                      added: resp && resp.added,
+                      existing: resp && resp.existing,
+                      not_found: resp && resp.not_found });
                 return resp;
             })['catch'](function (err) {
                 warn('POST list ' + listId + ' add failed',
@@ -1873,7 +1916,9 @@
         return traktFetch('/users/me/lists/' + listId + '/items/remove', { method: 'POST', body: body })
             .then(function (resp) {
                 log('POST list ' + listId + ' remove ok',
-                    { ids: ids, type: type, deleted: resp && resp.deleted });
+                    { ids: ids, type: type, body: body,
+                      deleted: resp && resp.deleted,
+                      not_found: resp && resp.not_found });
                 return resp;
             })['catch'](function (err) {
                 warn('POST list ' + listId + ' remove failed',
