@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.10.0-rc4-diag';
+    var VERSION         = '0.10.0-rc5-diag';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // Папки Lampa, которые плагин read/write-ит к Trakt. По ним строится
@@ -102,6 +102,17 @@
     function log(msg, data) {
         if (!Lampa.Storage.field(STORAGE_LOGGING)) return;
         data !== undefined ? console.log(SYNC_TAG, msg, data) : console.log(SYNC_TAG, msg);
+    }
+
+    // Diag-вариант log: сериализует data в JSON-строку, чтобы Lampa лог-файл
+    // не сворачивал объект в `{…}`. Использовать для критичных диагностических
+    // мест, где нужны точные значения полей (body POST'а, added/not_found
+    // в ответе Trakt и т.п.). Включается тем же тумблером logging.
+    function logj(msg, data) {
+        if (!Lampa.Storage.field(STORAGE_LOGGING)) return;
+        var s;
+        try { s = JSON.stringify(data); } catch (e) { s = String(data); }
+        console.log(SYNC_TAG, msg, s);
     }
 
     function warn(msg, data) {
@@ -1738,7 +1749,8 @@
             // rc4-diag: показываем по каждой карточке в каких ячейках лежит,
             // чтобы при hdr_count < union_count было видно, какой именно tmdb
             // не сохраняется в /users/hidden/dropped.
-            log('thrown union details', union.map(function (it) {
+            // rc5-diag: через logj — иначе Lampa-лог сворачивает массив в `{…}`.
+            logj('thrown union details', union.map(function (it) {
                 var s = sources[String(it.tmdb)] || {};
                 return {
                     tmdb:  it.tmdb,
@@ -1814,7 +1826,7 @@
         // rc4-diag: разворачиваем плановые операции, чтобы видеть какая
         // карточка идёт куда — иначе по одному «plan: 4» не понять, что
         // именно не доехало до hdr.
-        log('thrown canonization items', pending.map(function (op) {
+        logj('thrown canonization items', pending.map(function (op) {
             if (op.kind === 'list_add') {
                 return {
                     kind:  op.kind,
@@ -1863,7 +1875,7 @@
             .then(function (resp) {
                 // rc4-diag: показываем full added/not_found, чтобы увидеть,
                 // принял ли Trakt запись или отверг тихо (added.shows: 0).
-                log('POST /users/hidden/' + section + ' ok',
+                logj('POST /users/hidden/' + section + ' ok',
                     { ids: ids, body: body,
                       added: resp && resp.added,
                       not_found: resp && resp.not_found });
@@ -1880,7 +1892,7 @@
         if (!body) return Promise.resolve(null);
         return traktFetch('/users/hidden/' + section + '/remove', { method: 'POST', body: body })
             .then(function (resp) {
-                log('POST /users/hidden/' + section + '/remove ok',
+                logj('POST /users/hidden/' + section + '/remove ok',
                     { ids: ids, body: body,
                       deleted: resp && resp.deleted,
                       not_found: resp && resp.not_found });
@@ -1897,7 +1909,7 @@
         if (!body || !listId) return Promise.resolve(null);
         return traktFetch('/users/me/lists/' + listId + '/items', { method: 'POST', body: body })
             .then(function (resp) {
-                log('POST list ' + listId + ' add ok',
+                logj('POST list ' + listId + ' add ok',
                     { ids: ids, type: type, body: body,
                       added: resp && resp.added,
                       existing: resp && resp.existing,
@@ -1915,7 +1927,7 @@
         if (!body || !listId) return Promise.resolve(null);
         return traktFetch('/users/me/lists/' + listId + '/items/remove', { method: 'POST', body: body })
             .then(function (resp) {
-                log('POST list ' + listId + ' remove ok',
+                logj('POST list ' + listId + ' remove ok',
                     { ids: ids, type: type, body: body,
                       deleted: resp && resp.deleted,
                       not_found: resp && resp.not_found });
