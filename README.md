@@ -45,7 +45,9 @@ https://mainsync-afk.github.io/test-lampa/trakt_folder_sync.js
 
 ## Текущее состояние (в разработке)
 
-Плагин переписывается с нуля по SPEC.md. Текущая версия — **0.10.0-rc5-diag**:
+Плагин переписывается с нуля по SPEC.md. Текущая версия — **0.11.0**:
+
+- [x] **Book exclusivity при переносе в статусную папку** (0.11.0): закладка book/watchlist должна сниматься, когда карточка переносится в любую статусную папку (look/viewed/thrown). Раньше при перетаскивании сериала из Закладок в, например, Брошено — Trakt принимал hidden, но в watchlist карточка оставалась, и на следующем pull-reconcile возвращалась в Закладки (Trakt → Lampa book) — в Lampa получался двойной статус «Брошено + Закладка». Для look/viewed Trakt сам убирает из watchlist через настройку «Auto remove from watchlist on watch» (срабатывает при scrobble — а у нас scrobble есть и для look-подсказки S01E01, и для viewed-всех-серий). Для thrown auto-remove не помогает — мы пишем в hidden, scrobble не происходит. Решение симметрично-полное: новый хелпер `clearBookMark(card)` зовётся из `pushHistory` при `action='add'` для look/viewed/thrown, снимает Lampa-mark book (через `findRealCard` + `Favorite.remove('book', ...)` под `markOwn`-защитой от петли) и шлёт `POST /sync/watchlist/remove` в Trakt (idempotent — если в Trakt не было, ответ `deleted.movies/shows = 0` молча). Только в одну сторону: при удалении из статусной папки book обратно не ставим — пользователь сам решает. continued исключён — в эту папку прямого add от пользователя не бывает (производное состояние). Reverse-логика «add в book → снять статус» не делается: если пользователь явно ставит закладку на уже просмотренный сериал, это его право — пусть остаётся в Просмотрено + Закладки.
 
 - [x] Скелет плагина, гейт по токену, настройки.
 - [x] Собственный сетевой слой `traktFetch` к прокси Trakt.

@@ -8,7 +8,7 @@
     // Константы
     // -----------------------------------------------------------------------
 
-    var VERSION         = '0.10.0-rc5-diag';
+    var VERSION         = '0.11.0';
 
     var SYNC_TAG        = 'TraktFolderSync';
     // Папки Lampa, которые плагин read/write-ит к Trakt. По ним строится
@@ -1308,6 +1308,85 @@
     }
 
     // -----------------------------------------------------------------------
+    // v0.11.0: book exclusivity — при переносе карточки в любой статус
+    // (look/viewed/thrown) book/watchlist должен сняться.
+    //
+    // Для look Trakt сам уберёт из watchlist при первом scrobble (настройка
+    // «Auto remove from watchlist on watch», включена по умолчанию). Но:
+    //  – она работает только при scrobble на Trakt-стороне; нам всё равно
+    //    надо синхронно снять Lampa-mark book, иначе пользователь увидит
+    //    закладку на карточке, лежащей в look, и Trakt уже без неё;
+    //  – для viewed: scrobble тоже срабатывает (отметка S01..Sn эпизодов
+    //    через /sync/history запускает auto-remove);
+    //  – для thrown auto-remove НЕ срабатывает: мы пишем в hidden, не
+    //    scrobble. Тут /sync/watchlist/remove обязателен.
+    //
+    // Логика — идемпотентная: если в book пусто и в Trakt watchlist пусто,
+    // запросы вернутся «ничего не удалили», предупреждение не показываем.
+    // Это write-путь: пишем в Trakt и снимаем mark в Lampa, не читаем.
+    function clearBookMark(card) {
+        if (!hasToken()) return;
+        var id = tmdbId(card);
+        if (!id) return;
+
+        // Lampa: снимаем mark book если стоит. markOwn чтобы наш же листенер
+        // на Favorite.remove('book', ...) не выстрелил повторно в pushWatchlist
+        // и не закрутил петлю.
+        var hadInBook = false;
+        try {
+            var probe = findRealCard(id) || card;
+            if (probe && Lampa.Favorite && typeof Lampa.Favorite.check === 'function') {
+                var status = Lampa.Favorite.check(probe) || {};
+                hadInBook = !!status.book;
+                if (hadInBook) {
+                    log('clearBookMark: снимаю mark book в Lampa', { id: id });
+                    markOwn(id);
+                    try { Lampa.Favorite.remove('book', probe); }
+                    catch (e) { warn('clearBookMark: Favorite.remove err', e); }
+                }
+            }
+        } catch (e) { warn('clearBookMark: check err', e); }
+
+        // Trakt: явно убираем из watchlist. Делаем всегда (idempotent), даже
+        // если в Lampa-mark book не было — пользователь мог поставить
+        // закладку через Trakt-веб, а у нас sync не был. Бесполезный запрос
+        // для виду подавляем по ответу.
+        resolveCardType(card).then(function (type) {
+            if (type !== 'show' && type !== 'movie') {
+                // тощая карточка без полей — не можем построить body
+                // без типа. Если в book ничего не было, считаем no-op.
+                if (!hadInBook) return;
+                // Был mark book — попробуем угадать тип, иначе бросим.
+                type = cardIsShow(card) ? 'show' : 'movie';
+            }
+            var body = buildWatchlistBody(id, type);
+            if (!body) return;
+            traktFetch('/sync/watchlist/remove', { method: 'POST', body: body })
+                .then(function (data) {
+                    var bucket  = data && data.deleted;
+                    var changed = bucket &&
+                                  ((bucket.movies || 0) > 0 || (bucket.shows || 0) > 0);
+                    if (changed) {
+                        log('clearBookMark: watchlist remove ok', {
+                            id: id, type: type, resp: data
+                        });
+                        addPendingOp({
+                            id: id, type: type, folder: 'book', action: 'remove'
+                        });
+                    } else {
+                        log('clearBookMark: уже не было в Trakt watchlist',
+                            { id: id, type: type });
+                    }
+                })['catch'](function (err) {
+                    warn('clearBookMark: watchlist remove failed', {
+                        id: id, type: type,
+                        status: err && err.status, response: err && err.response
+                    });
+                });
+        });
+    }
+
+    // -----------------------------------------------------------------------
     // Write-путь для статусных папок: /sync/history[/remove]
     // -----------------------------------------------------------------------
     //
@@ -1505,6 +1584,16 @@
         var id = tmdbId(card);
         if (!id) { warn('pushHistory: нет tmdb id', card); return; }
         if (checkWriteDedup(action, folder, id)) return;
+
+        // v0.11.0: book exclusivity. При add в любую статусную папку
+        // (look/viewed/thrown) снимаем закладку book/watchlist. Не делаем
+        // для continued — это производная папка, прямого add от пользователя
+        // не бывает (см. ниже). Для remove — не трогаем: пользователь сам
+        // решает, ставить ли закладку обратно.
+        if (action === 'add' &&
+            (folder === 'look' || folder === 'viewed' || folder === 'thrown')) {
+            clearBookMark(card);
+        }
 
         if (folder === 'continued') {
             // continued — производная «догнан + выходит». Пользователь
